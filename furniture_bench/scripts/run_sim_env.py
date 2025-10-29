@@ -89,6 +89,7 @@ def main():
     )
 
     parser.add_argument("--num-envs", type=int, default=1)
+    parser.add_argument("--num-arms", type=int, default=1)
     args = parser.parse_args()
 
     # Create FurnitureSim environment.
@@ -106,6 +107,7 @@ def main():
         act_rot_repr=args.act_rot_repr,
         compute_device_id=args.compute_device_id,
         graphics_device_id=args.graphics_device_id,
+        num_arms=args.num_arms,
     )
 
     # Initialize FurnitureSim.

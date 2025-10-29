@@ -76,7 +76,7 @@ config: Dict[str, Any] = {
         },
         "color_img_size": (1280, 720),
         "depth_img_size": (1280, 720),
-        "resized_img_size": (224, 224),
+        "resized_img_size": (1280, 720), #(224, 224),
         "frame_rate": 30,
     },
     "furniture": {
