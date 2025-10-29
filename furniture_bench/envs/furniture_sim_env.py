@@ -787,10 +787,19 @@ class FurnitureSimEnv(gym.Env):
                 else:
                     action_quat = C.axisangle2quat(action[env_idx, arm_idx, 3:6])
 
-                self.osc_ctrls[env_idx * self.num_arms + arm_idx].set_goal(
-                    action[env_idx, arm_idx, :3] + ee_pos[env_idx, arm_idx],
-                    C.quat_multiply(ee_quat[env_idx, arm_idx], action_quat).to(self.device),
-                )
+                if self.num_envs == 1:
+                    ee_quat_for_mul = ee_quat[arm_idx].unsqueeze(0)
+                    goal_pos = action[env_idx, arm_idx, :3] + ee_pos[arm_idx]
+                else:
+                    ee_quat_for_mul = ee_quat[env_idx, arm_idx].unsqueeze(0)
+                    goal_pos = action[env_idx, arm_idx, :3] + ee_pos[env_idx, arm_idx]
+                
+                action_quat_for_mul = action_quat.unsqueeze(0)
+                multiplied_quat = C.quat_mul(ee_quat_for_mul, action_quat_for_mul).squeeze(0)
+
+                controller = self.osc_ctrls[env_idx * self.num_arms + arm_idx]
+                controller.ee_pos_desired.copy_(goal_pos)
+                controller.ee_quat_desired.copy_(multiplied_quat)
 
         for _ in range(sim_steps):
             self.refresh()
@@ -818,8 +827,15 @@ class FurnitureSimEnv(gym.Env):
 
                     state_dict = {}
                     ee_pos, ee_quat = self.get_ee_pose()
+                    if self.num_envs == 1:
+                        ee_p = ee_pos[arm_idx]
+                        ee_q = ee_quat[arm_idx]
+                    else:
+                        ee_p = ee_pos[env_idx, arm_idx]
+                        ee_q = ee_quat[env_idx, arm_idx]
+
                     state_dict["ee_pose"] = C.pose2mat(
-                        ee_pos[env_idx, arm_idx], ee_quat[env_idx, arm_idx], self.device
+                        ee_p, ee_q, self.device
                     ).t()  # OSC expect column major
                     state_dict["joint_positions"] = self.dof_pos[env_idx][arm_idx * 9 : arm_idx * 9 + 7]
                     state_dict["joint_velocities"] = self.dof_vel[env_idx][arm_idx * 9 : arm_idx * 9 + 7]
@@ -1022,14 +1038,24 @@ class FurnitureSimEnv(gym.Env):
             else torch.sqrt(kp) * 2.0
         )
 
+        # Make controller more responsive for scripted large steps
+        kp = kp * 2.0
+        kv = kv * 2.0
+
         ee_pos, ee_quat = self.get_ee_pose()
         for env_idx in range(self.num_envs):
             for arm_idx in range(self.num_arms):
+                if self.num_envs == 1:
+                    ee_p = ee_pos[arm_idx]
+                    ee_q = ee_quat[arm_idx]
+                else:
+                    ee_p = ee_pos[env_idx, arm_idx]
+                    ee_q = ee_quat[env_idx, arm_idx]
                 self.osc_ctrls.append(
                     osc_factory(
                         real_robot=False,
-                        ee_pos_current=ee_pos[env_idx, arm_idx],
-                        ee_quat_current=ee_quat[env_idx, arm_idx],
+                        ee_pos_current=ee_p,
+                        ee_quat_current=ee_q,
                         init_joints=torch.tensor(
                             config["robot"]["reset_joints"], device=self.device
                         ),
@@ -1044,12 +1070,33 @@ class FurnitureSimEnv(gym.Env):
                 )
         self.ctrl_started = True
 
-    def get_ee_pose(self):
+    def get_ee_pose(self, arm_idx=None):
         """Gets end-effector pose in world coordinate."""
-        hand_pos = self.rb_states[self.ee_idxs, :3].view(self.num_envs, self.num_arms, 3)
-        hand_quat = self.rb_states[self.ee_idxs, 3:7].view(self.num_envs, self.num_arms, 4)
-        base_pos = self.rb_states[self.base_idxs, :3].view(self.num_envs, self.num_arms, 3)
-        base_quat = self.rb_states[self.base_idxs, 3:7].view(self.num_envs, self.num_arms, 4) # Align with world coordinate.
+        if self.num_arms > 1:
+            hand_pos = self.rb_states[self.ee_idxs, :3].view(self.num_envs, self.num_arms, 3)
+            hand_quat = self.rb_states[self.ee_idxs, 3:7].view(self.num_envs, self.num_arms, 4)
+            base_pos = self.rb_states[self.base_idxs, :3].view(self.num_envs, self.num_arms, 3)
+            
+            ee_pos = hand_pos - base_pos
+            ee_quat = hand_quat
+
+            if self.num_envs == 1:
+                ee_pos = ee_pos.squeeze(0)
+                ee_quat = ee_quat.squeeze(0)
+
+            if arm_idx is not None:
+                if self.num_envs == 1:
+                    ee_pos = ee_pos[arm_idx]
+                    ee_quat = ee_quat[arm_idx]
+                else:
+                    ee_pos = ee_pos[:, arm_idx]
+                    ee_quat = ee_quat[:, arm_idx]
+            return ee_pos, ee_quat
+
+        hand_pos = self.rb_states[self.ee_idxs, :3]
+        hand_quat = self.rb_states[self.ee_idxs, 3:7]
+        base_pos = self.rb_states[self.base_idxs, :3]
+        base_quat = self.rb_states[self.base_idxs, 3:7]  # Align with world coordinate.
         return hand_pos - base_pos, hand_quat
 
     def gripper_width(self):
@@ -1467,16 +1514,228 @@ class FurnitureSimEnv(gym.Env):
             Tuple (action for the assembly task, skill complete mask)
         """
         assert self.num_envs == 1  # Only support one environment for now.
+        if self.furniture_name == "square_table":
+            if self.num_arms != 2:
+                raise NotImplementedError("Square table assembly script requires 2 arms.")
+            
+            # Initialize script state
+            if not hasattr(self, 'script_phase'):
+                self.script_phase = 0  # 0: left arm picks tabletop, 1-4: right arm assembles legs
+            if not hasattr(self, 'arm_state_left'):
+                self.arm_state_left = "start"
+            if not hasattr(self, 'arm_state_right'):
+                self.arm_state_right = "idle"
+            if not hasattr(self, 'right_substate'):
+                self.right_substate = "approach_leg"
+            if not hasattr(self, 'current_leg_idx'):
+                self.current_leg_idx = 0
+            if not hasattr(self, 'hold_pose_wrt_world'):
+                self.hold_pose_wrt_world = None
+            if not hasattr(self, 'debug_counter'):
+                self.debug_counter = 0
+            
+            # Get current poses
+            ee_pos_left, ee_quat_left = self.get_ee_pose(0)
+            ee_pos_right, ee_quat_right = self.get_ee_pose(1)
+            
+            # Get tabletop pose
+            part_top_name = self.furniture.parts[0].name
+            top_rb_idx = self.part_idxs[part_top_name][0]
+            part_top_pose = C.to_homogeneous(
+                self.rb_states[top_rb_idx, :3],
+                C.quat2mat(self.rb_states[top_rb_idx, 3:7]),
+            )
+            
+            # Left arm state machine (pick and hold tabletop)
+            delta_pos_left = torch.zeros(3, device=self.device)
+            delta_quat_left = torch.tensor([0, 0, 0, 1], device=self.device)
+            gripper_left = torch.tensor([-1], device=self.device)
+
+            if self.arm_state_left == "start":
+                # Move above tabletop
+                goal_pos = part_top_pose[:3, 3] + torch.tensor([0, 0, 0.2], device=self.device)
+                goal_quat = torch.tensor([0, 1, 0, 0], device=self.device)  # Pointing down
+                delta_pos_left = goal_pos - ee_pos_left
+                delta_quat_left = C.quat_mul(C.quat_conjugate(ee_quat_left.unsqueeze(0)), goal_quat.unsqueeze(0)).squeeze(0)
+                if torch.norm(delta_pos_left) < 0.05:
+                    self.arm_state_left = "descend"
+            
+            elif self.arm_state_left == "descend":
+                # Descend to tabletop
+                goal_pos = part_top_pose[:3, 3] + torch.tensor([0, 0, 0.03], device=self.device)
+                goal_quat = torch.tensor([0, 1, 0, 0], device=self.device)
+                delta_pos_left = goal_pos - ee_pos_left
+                delta_quat_left = C.quat_mul(C.quat_conjugate(ee_quat_left.unsqueeze(0)), goal_quat.unsqueeze(0)).squeeze(0)
+                if torch.norm(delta_pos_left) < 0.05:
+                    self.arm_state_left = "grasp"
+
+            elif self.arm_state_left == "grasp":
+                # Close gripper and capture hold pose
+                gripper_left = torch.tensor([1], device=self.device)
+                # Capture the current tabletop pose for stable holding
+                self.hold_tabletop_pose = part_top_pose.clone()
+                self.arm_state_left = "lift"
+            
+            elif self.arm_state_left == "lift":
+                # Lift tabletop to assembly height
+                goal_pos = part_top_pose[:3, 3] + torch.tensor([0, 0, 0.18], device=self.device)
+                goal_quat = torch.tensor([0, 1, 0, 0], device=self.device)
+                delta_pos_left = goal_pos - ee_pos_left
+                delta_quat_left = C.quat_mul(C.quat_conjugate(ee_quat_left.unsqueeze(0)), goal_quat.unsqueeze(0)).squeeze(0)
+                gripper_left = torch.tensor([1], device=self.device)
+                if torch.norm(delta_pos_left) < 0.05:
+                    self.arm_state_left = "hold_assembly"
+                    self.script_phase = 1  # Start right arm assembly
+                    
+            elif self.arm_state_left == "hold_assembly":
+                # Maintain stable hold position for assembly
+                goal_pos = self.hold_tabletop_pose[:3, 3] + torch.tensor([0, 0, 0.18], device=self.device)
+                goal_quat = torch.tensor([0, 1, 0, 0], device=self.device)
+                delta_pos_left = 0.2 * (goal_pos - ee_pos_left)  # Gentle correction
+                delta_quat_left = C.quat_mul(C.quat_conjugate(ee_quat_left.unsqueeze(0)), goal_quat.unsqueeze(0)).squeeze(0)
+                gripper_left = torch.tensor([1], device=self.device)
+
+            # Right arm state machine (assemble legs)
+            delta_pos_right = torch.zeros(3, device=self.device)
+            delta_quat_right = torch.tensor([0, 0, 0, 1], device=self.device)
+            gripper_right = torch.tensor([-1], device=self.device)
+
+
+            if self.script_phase >= 1 and self.script_phase <= 4:
+                # Get current leg to assemble
+                leg_order = [4, 3, 1, 2]  # Assembly order from should_be_assembled
+                if self.current_leg_idx < len(leg_order):
+                    leg_idx = leg_order[self.current_leg_idx]
+                    leg_name = self.furniture.parts[leg_idx].name
+                    leg_rb_idx = self.part_idxs[leg_name][0]
+                    leg_pose = C.to_homogeneous(
+                        self.rb_states[leg_rb_idx, :3],
+                        C.quat2mat(self.rb_states[leg_rb_idx, 3:7]),
+                    )
+                    
+                    # Use current tabletop pose for target computation
+                    current_tabletop_pose = self.hold_tabletop_pose if hasattr(self, 'hold_tabletop_pose') else part_top_pose
+                    
+                    if self.right_substate == "approach_leg":
+                        # Move above leg
+                        goal_pos = leg_pose[:3, 3] + torch.tensor([0, 0, 0.15], device=self.device)
+                        goal_quat = torch.tensor([0, 1, 0, 0], device=self.device)  # Pointing down
+                        delta_pos_right = goal_pos - ee_pos_right
+                        delta_quat_right = C.quat_mul(C.quat_conjugate(ee_quat_right.unsqueeze(0)), goal_quat.unsqueeze(0)).squeeze(0)
+                        if torch.norm(delta_pos_right) < 0.05:
+                            self.right_substate = "grasp_leg"
+                            
+                    elif self.right_substate == "grasp_leg":
+                        # Descend and grasp leg
+                        goal_pos = leg_pose[:3, 3] + torch.tensor([0, 0, 0.02], device=self.device)
+                        goal_quat = torch.tensor([0, 1, 0, 0], device=self.device)
+                        delta_pos_right = goal_pos - ee_pos_right
+                        delta_quat_right = C.quat_mul(C.quat_conjugate(ee_quat_right.unsqueeze(0)), goal_quat.unsqueeze(0)).squeeze(0)
+                        gripper_right = torch.tensor([1], device=self.device)
+                        if torch.norm(delta_pos_right) < 0.05:
+                            self.right_substate = "lift_leg"
+                            
+                    elif self.right_substate == "lift_leg":
+                        # Lift leg straight up
+                        goal_pos = ee_pos_right + torch.tensor([0, 0, 0.20], device=self.device)
+                        delta_pos_right = goal_pos - ee_pos_right
+                        gripper_right = torch.tensor([1], device=self.device)
+                        if torch.norm(delta_pos_right) < 0.05:
+                            self.right_substate = "move_above_target"
+                            
+                    elif self.right_substate == "move_above_target":
+                        # Move to assembly position above target hole
+                        rel_poses = self.furniture.assembled_rel_poses[(0, leg_idx)]
+                        target_rel_pose = rel_poses[0]  # Use first valid pose
+                        
+                        # Transform to world coordinates using current tabletop pose
+                        target_world_pose = current_tabletop_pose @ target_rel_pose
+                        target_pos = target_world_pose[:3, 3] + torch.tensor([0, 0, 0.10], device=self.device)  # Pre-insertion height
+                        target_quat = C.mat2quat(target_world_pose[:3, :3])
+                        
+                        delta_pos_right = target_pos - ee_pos_right
+                        delta_quat_right = C.quat_mul(C.quat_conjugate(ee_quat_right.unsqueeze(0)), target_quat.unsqueeze(0)).squeeze(0)
+                        gripper_right = torch.tensor([1], device=self.device)
+                        if torch.norm(delta_pos_right) < 0.05:
+                            self.right_substate = "insert_leg"
+                            
+                    elif self.right_substate == "insert_leg":
+                        # Insert leg into tabletop
+                        rel_poses = self.furniture.assembled_rel_poses[(0, leg_idx)]
+                        target_rel_pose = rel_poses[0]
+                        target_world_pose = current_tabletop_pose @ target_rel_pose
+                        target_pos = target_world_pose[:3, 3]  # Final insertion position
+                        target_quat = C.mat2quat(target_world_pose[:3, :3])
+                        
+                        delta_pos_right = target_pos - ee_pos_right
+                        delta_quat_right = C.quat_mul(C.quat_conjugate(ee_quat_right.unsqueeze(0)), target_quat.unsqueeze(0)).squeeze(0)
+                        gripper_right = torch.tensor([1], device=self.device)
+                        if torch.norm(delta_pos_right) < 0.05:
+                            self.right_substate = "release_leg"
+                            
+                    elif self.right_substate == "release_leg":
+                        # Release leg and retreat
+                        gripper_right = torch.tensor([-1], device=self.device)
+                        self.right_substate = "retreat"
+                        
+                    elif self.right_substate == "retreat":
+                        # Move up and away from assembly
+                        goal_pos = ee_pos_right + torch.tensor([0, 0, 0.15], device=self.device)
+                        delta_pos_right = goal_pos - ee_pos_right
+                        gripper_right = torch.tensor([-1], device=self.device)
+                        if torch.norm(delta_pos_right) < 0.05:
+                            # Move to next leg
+                            self.current_leg_idx += 1
+                            self.script_phase += 1
+                            self.right_substate = "approach_leg"
+                            
+                            if self.current_leg_idx >= len(leg_order):
+                                # All legs assembled
+                                self.script_phase = 5
+                                self.arm_state_left = "done"
+                                self.arm_state_right = "done"
+            
+            # Speed up scripted motion: scale deltas, then clamp
+            speed_gain = 10.0  # aggressively speed up scripted motion
+            delta_pos_left = delta_pos_left * speed_gain
+            delta_pos_right = delta_pos_right * speed_gain
+
+            # Clamp actions for stability (increase for faster movement)
+            max_delta = 1.00  # allow very large per-tick moves
+            delta_pos_left = torch.clamp(delta_pos_left, -max_delta, max_delta)
+            delta_pos_right = torch.clamp(delta_pos_right, -max_delta, max_delta)
+            
+            # Debug output every 50 steps
+            if not hasattr(self, 'debug_counter'):
+                self.debug_counter = 0
+            self.debug_counter += 1
+            if self.debug_counter % 50 == 0:
+                print(f"Step {self.debug_counter}: script_phase={self.script_phase}, left_state={self.arm_state_left}, right_state={self.right_substate}")
+                print(f"  Left delta: {delta_pos_left.norm():.4f}, Right delta: {delta_pos_right.norm():.4f}")
+                print(f"  Left pos: {ee_pos_left}, Right pos: {ee_pos_right}")
+            
+            # Create action tensors
+            action_left = torch.cat([delta_pos_left, delta_quat_left, gripper_left])
+            action_right = torch.cat([delta_pos_right, delta_quat_right, gripper_right])
+            
+            # Check if assembly is complete
+            skill_complete = 1 if self.script_phase >= 5 else 0
+            
+            return torch.stack([action_left, action_right]).unsqueeze(0), skill_complete
+        
         if self.furniture_name not in ["one_leg", "cabinet", "lamp", "round_table"]:
             raise NotImplementedError("[one_leg, cabinet, lamp, round_table] are supported for scripted agent")
 
-        if self.assemble_idx > len(self.furniture.should_be_assembled):
-            return torch.tensor([0, 0, 0, 0, 0, 0, 1, -1], device=self.device)
+        if self.num_arms > 1:
+            raise NotImplementedError("Scripted agent only supports one arm for this furniture.")
 
         ee_pos, ee_quat = self.get_ee_pose()
         gripper_width = self.gripper_width()
         ee_pos, ee_quat = ee_pos.squeeze(), ee_quat.squeeze()
-
+        
+        if self.assemble_idx > len(self.furniture.should_be_assembled):
+            return torch.tensor([0, 0, 0, 0, 0, 0, 1, -1], device=self.device)
+            
         if self.move_neutral:
             if ee_pos[2] <= 0.15 - 0.01:
                 gripper = torch.tensor([-1], dtype=torch.float32, device=self.device)
@@ -1490,7 +1749,6 @@ class FurnitureSimEnv(gym.Env):
             else:
                 self.move_neutral = False
         part_idx1, part_idx2 = self.furniture.should_be_assembled[self.assemble_idx]
-
         part1 = self.furniture.parts[part_idx1]
         part1_name = self.furniture.parts[part_idx1].name
         part1_pose = C.to_homogeneous(
@@ -1547,9 +1805,7 @@ class FurnitureSimEnv(gym.Env):
                 self.april_to_robot_mat,
                 self.furniture.parts[part_idx1].name,
             )
-
         delta_pos = goal_pos - ee_pos
-
         # Scale translational action.
         delta_pos_sign = delta_pos.sign()
         delta_pos = torch.abs(delta_pos) * 2
@@ -1557,13 +1813,11 @@ class FurnitureSimEnv(gym.Env):
             if delta_pos[i] > 0.03:
                 delta_pos[i] = 0.03 + (delta_pos[i] - 0.03) * np.random.normal(1.5, 0.1)
         delta_pos = delta_pos * delta_pos_sign
-
         # Clamp too large action.
         max_delta_pos = 0.11 + 0.01 * torch.rand(3, device=self.device)
         max_delta_pos[2] -= 0.04
         delta_pos = torch.clamp(delta_pos, min=-max_delta_pos, max=max_delta_pos)
-
-        delta_quat = C.quat_mul(C.quat_conjugate(ee_quat), goal_ori)
+        delta_quat = C.quat_mul(C.quat_conjugate(ee_quat.unsqueeze(0)), goal_ori.unsqueeze(0)).squeeze(0)
         # Add random noise to the action.
         if (
             self.furniture.parts[part_idx2].state_no_noise()
@@ -1585,29 +1839,4 @@ class FurnitureSimEnv(gym.Env):
             ).to(self.device)
         action = torch.concat([delta_pos, delta_quat, gripper])
         return action.unsqueeze(0), skill_complete
-
-    def assembly_success(self):
-        return self._done().squeeze()
-
-    def __del__(self):
-        if not self.headless:
-            self.isaac_gym.destroy_viewer(self.viewer)
-        self.isaac_gym.destroy_sim(self.sim)
-
-        if self.record:
-            self.video_writer.release()
-
-
-class FurnitureSimFullEnv(FurnitureSimEnv):
-    """FurnitureSim environment with all available observations."""
-
-    def __init__(self, **kwargs):
-        super().__init__(obs_keys=FULL_OBS, **kwargs)
-
-
-class FurnitureSimStateEnv(FurnitureSimEnv):
-    """FurnitureSim environment with state observations."""
-
-    def __init__(self, **kwargs):
-        obs_keys = DEFAULT_STATE_OBS
-        super().__init__(obs_keys=obs_keys, concat_robot_state=True, **kwargs)
+        

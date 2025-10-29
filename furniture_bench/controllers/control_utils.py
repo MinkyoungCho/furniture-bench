@@ -222,8 +222,8 @@ def quat_multiply(q1: torch.Tensor, q0: torch.Tensor):
     >>> np.allclose(q, [-44, -14, 48, 28])
     True
     """
-    x0, y0, z0, w0 = float(q0[0]), float(q0[1]), float(q0[2]), float(q0[3])
-    x1, y1, z1, w1 = float(q1[0]), float(q1[1]), float(q1[2]), float(q1[3])
+    x0, y0, z0, w0 = q0[0], q0[1], q0[2], q0[3]
+    x1, y1, z1, w1 = q1[0], q1[1], q1[2], q1[3]
     return torch.tensor(
         (
             x1 * w0 + y1 * z0 - z1 * y0 + w1 * x0,
