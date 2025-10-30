@@ -279,65 +279,62 @@ class FurnitureSimEnv(gym.Env):
             bg_handle = self.isaac_gym.create_actor(
                 env, self.background_asset, bg_pose, "background", i, 0
             )
+            # TODO: Make config
+            obstacle_pose = gymapi.Transform()
+            obstacle_pose.p = gymapi.Vec3(
+                self.base_tag_pose.p.x + 0.37 + 0.01, 0.0, table_surface_z + 0.015
+            )
+            obstacle_pose.r = gymapi.Quat.from_axis_angle(
+                gymapi.Vec3(0, 0, 1), 0.5 * np.pi
+            )
 
-            # Skip obstacles when using two arms (requested)
-            if self.num_arms == 1:
-                # Front obstacle
+            obstacle_handle = self.isaac_gym.create_actor(
+                env, self.obstacle_front_asset, obstacle_pose, f"obstacle_front", i, 0
+            )
+            part_idx = self.isaac_gym.get_actor_rigid_body_index(
+                env, obstacle_handle, 0, gymapi.DOMAIN_SIM
+            )
+            if self.part_idxs.get("obstacle_front") is None:
+                self.part_idxs["obstacle_front"] = [part_idx]
+            else:
+                self.part_idxs[f"obstacle_front"].append(part_idx)
+
+            for j, name in enumerate(["obstacle_right", "obstacle_left"]):
+                y = -0.175 if j == 0 else 0.175
                 obstacle_pose = gymapi.Transform()
                 obstacle_pose.p = gymapi.Vec3(
-                    self.base_tag_pose.p.x + 0.37 + 0.01, 0.0, table_surface_z + 0.015
+                    self.base_tag_pose.p.x + 0.37 + 0.01 - 0.075,
+                    y,
+                    table_surface_z + 0.015,
                 )
                 obstacle_pose.r = gymapi.Quat.from_axis_angle(
                     gymapi.Vec3(0, 0, 1), 0.5 * np.pi
                 )
 
                 obstacle_handle = self.isaac_gym.create_actor(
-                    env, self.obstacle_front_asset, obstacle_pose, f"obstacle_front", i, 0
+                    env, self.obstacle_side_asset, obstacle_pose, name, i, 0
                 )
                 part_idx = self.isaac_gym.get_actor_rigid_body_index(
                     env, obstacle_handle, 0, gymapi.DOMAIN_SIM
                 )
-                if self.part_idxs.get("obstacle_front") is None:
-                    self.part_idxs["obstacle_front"] = [part_idx]
+                if self.part_idxs.get(name) is None:
+                    self.part_idxs[name] = [part_idx]
                 else:
-                    self.part_idxs[f"obstacle_front"].append(part_idx)
-
-                # Side obstacles
-                for j, name in enumerate(["obstacle_right", "obstacle_left"]):
-                    y = -0.175 if j == 0 else 0.175
-                    obstacle_pose = gymapi.Transform()
-                    obstacle_pose.p = gymapi.Vec3(
-                        self.base_tag_pose.p.x + 0.37 + 0.01 - 0.075,
-                        y,
-                        table_surface_z + 0.015,
-                    )
-                    obstacle_pose.r = gymapi.Quat.from_axis_angle(
-                        gymapi.Vec3(0, 0, 1), 0.5 * np.pi
-                    )
-
-                    obstacle_handle = self.isaac_gym.create_actor(
-                        env, self.obstacle_side_asset, obstacle_pose, name, i, 0
-                    )
-                    part_idx = self.isaac_gym.get_actor_rigid_body_index(
-                        env, obstacle_handle, 0, gymapi.DOMAIN_SIM
-                    )
-                    if self.part_idxs.get(name) is None:
-                        self.part_idxs[name] = [part_idx]
-                    else:
-                        self.part_idxs[name].append(part_idx)
+                    self.part_idxs[name].append(part_idx)
             # Add robot.
-            # Generate poses for any number of arms along Y axis
             franka_poses = []
-            if self.num_arms <= 1:
+            if self.num_arms == 1:
                 franka_poses.append(self.franka_pose)
             else:
-                ys = np.linspace(-0.4, 0.4, self.num_arms)
-                for y in ys:
-                    pose = gymapi.Transform()
-                    pose.p = gymapi.Vec3(self.franka_pose.p.x, float(y), self.franka_pose.p.z)
-                    yaw = -0.2 if y > 0 else (0.2 if y < 0 else 0.0)
-                    pose.r = gymapi.Quat.from_axis_angle(gymapi.Vec3(0, 0, 1), yaw)
-                    franka_poses.append(pose)
+                franka_pose1 = gymapi.Transform()
+                franka_pose1.p = gymapi.Vec3(self.franka_pose.p.x, -0.4, self.franka_pose.p.z)
+                franka_pose1.r = gymapi.Quat.from_axis_angle(gymapi.Vec3(0, 0, 1), 0.2)
+                franka_poses.append(franka_pose1)
+
+                franka_pose2 = gymapi.Transform()
+                franka_pose2.p = gymapi.Vec3(self.franka_pose.p.x, 0.4, self.franka_pose.p.z)
+                franka_pose2.r = gymapi.Quat.from_axis_angle(gymapi.Vec3(0, 0, 1), -0.2)
+                franka_poses.append(franka_pose2)
 
             franka_handles = []
             for arm_idx in range(self.num_arms):
@@ -1076,11 +1073,11 @@ class FurnitureSimEnv(gym.Env):
     def get_ee_pose(self, arm_idx=None):
         """Gets end-effector pose in world coordinate."""
         if self.num_arms > 1:
-            # Return EE pose in WORLD coordinates
             hand_pos = self.rb_states[self.ee_idxs, :3].view(self.num_envs, self.num_arms, 3)
             hand_quat = self.rb_states[self.ee_idxs, 3:7].view(self.num_envs, self.num_arms, 4)
+            base_pos = self.rb_states[self.base_idxs, :3].view(self.num_envs, self.num_arms, 3)
             
-            ee_pos = hand_pos
+            ee_pos = hand_pos - base_pos
             ee_quat = hand_quat
 
             if self.num_envs == 1:
@@ -1096,10 +1093,11 @@ class FurnitureSimEnv(gym.Env):
                     ee_quat = ee_quat[:, arm_idx]
             return ee_pos, ee_quat
 
-        # Single-arm: return WORLD coordinates
         hand_pos = self.rb_states[self.ee_idxs, :3]
         hand_quat = self.rb_states[self.ee_idxs, 3:7]
-        return hand_pos, hand_quat
+        base_pos = self.rb_states[self.base_idxs, :3]
+        base_quat = self.rb_states[self.base_idxs, 3:7]  # Align with world coordinate.
+        return hand_pos - base_pos, hand_quat
 
     def gripper_width(self):
         dof_pos_reshaped = self.dof_pos.view(self.num_envs, self.num_arms, 9)
@@ -1510,103 +1508,6 @@ class FurnitureSimEnv(gym.Env):
         )
 
     def get_assembly_action(self) -> torch.Tensor:
-        """Step-by-step unit-skill scripted controller (from scratch).
-
-        Phase 0: Left arm descend above tabletop and touch.
-        Phase 1: Left arm draw a small circle above the tabletop (sanity check).
-        Phase 2+: Will extend with right-arm skills incrementally.
-        """
-        assert self.num_envs == 1
-        if self.furniture_name != "square_table" or self.num_arms != 2:
-            # Fallback to backup for other furniture or arm configs
-            print("Fallback to backup for other furniture or arm configs")
-            return self.get_assembly_action_v1_backup()
-
-        # Init simple FSM state
-        if not hasattr(self, "unit_phase"):
-            # 0: L descend, 1: L circle, 2: R approach leg above, 3: R descend + close, 4: done
-            self.unit_phase = 0
-        if not hasattr(self, "unit_timer"):
-            self.unit_timer = 0
-        if not hasattr(self, "debug_step"):
-            self.debug_step = 0
-        self.debug_step += 1
-        debug_tick = (self.debug_step % 60) == 0
-
-        # Current EE poses
-        ee_pos_left, ee_quat_left = self.get_ee_pose(0)
-        ee_pos_right, ee_quat_right = self.get_ee_pose(1)
-
-        # Tabletop pose (world)
-        top_name = self.furniture.parts[0].name
-        top_rb_idx = self.part_idxs[top_name][0]
-        top_pos = self.rb_states[top_rb_idx, :3]
-
-        # Outputs
-        dpos_L = torch.zeros(3, device=self.device)
-        dquat_L = torch.tensor([0, 1, 0, 0], device=self.device)  # point down
-        grip_L = torch.tensor([-1], device=self.device)
-
-        dpos_R = torch.zeros(3, device=self.device)
-        dquat_R = torch.tensor([0, 1, 0, 0], device=self.device)
-        grip_R = torch.tensor([-1], device=self.device)
-
-        # PHASE 0: Left descend 3 cm above tabletop
-        if self.unit_phase == 0:
-            goal_pos = top_pos + torch.tensor([0.0, 0.0, 0.03], device=self.device)
-            dpos_L = goal_pos - ee_pos_left
-            if debug_tick:
-                print(f"[UNIT {self.debug_step}] L descend: ee={ee_pos_left.detach().cpu().numpy()} goal={goal_pos.detach().cpu().numpy()} dpos={dpos_L.detach().cpu().numpy()} norm={torch.norm(dpos_L):.3f}")
-            if torch.norm(dpos_L) < 0.02:
-                self.unit_phase = 1
-
-        # PHASE 1: Left move to tabletop edge and grasp (with slight tilt); Right idle
-        elif self.unit_phase == 1:
-            # Record tabletop pose once for consistent holding frame
-            if not hasattr(self, "hold_tabletop_pose"):
-                top_quat = self.rb_states[top_rb_idx, 3:7]
-                self.hold_tabletop_pose = C.to_homogeneous(top_pos, C.quat2mat(top_quat))
-            # Compute an edge point in world coordinates using an offset in the tabletop local x-direction
-            R_top = self.hold_tabletop_pose[:3, :3]
-            edge_offset = 0.12  # meters toward one edge (heuristic)
-            offset_local = torch.tensor([edge_offset, 0.0, 0.0], device=self.device)
-            edge_world = R_top @ offset_local + self.hold_tabletop_pose[:3, 3]
-
-            # Approach 3 cm above the edge
-            goal_pos = edge_world + torch.tensor([0.0, 0.0, 0.03], device=self.device)
-            dpos_L = 0.4 * (goal_pos - ee_pos_left)
-
-            # Orientation: down with slight inward tilt to improve grasp on edge
-            down_quat = torch.tensor([0.0, 1.0, 0.0, 0.0], device=self.device)
-            tilt_axis = torch.tensor([1.0, 0.0, 0.0], device=self.device)
-            tilt_angle = np.radians(12.0)
-            tilt_quat = C.axisangle2quat(tilt_axis * tilt_angle)
-            desired_quat = C.quat_mul(down_quat.unsqueeze(0), tilt_quat.unsqueeze(0)).squeeze(0)
-            dquat_L = C.quat_mul(C.quat_conjugate(ee_quat_left.unsqueeze(0)), desired_quat.unsqueeze(0)).squeeze(0)
-
-            # Grasp when near the edge; otherwise keep open to avoid pushing
-            grip_L = torch.tensor([1], device=self.device) if torch.norm(goal_pos - ee_pos_left) < 0.02 else torch.tensor([-1], device=self.device)
-
-            if debug_tick:
-                print(
-                    f"[UNIT {self.debug_step}] L edge-grasp: ee={ee_pos_left.detach().cpu().numpy()} edge={edge_world.detach().cpu().numpy()} "
-                    f"goal={goal_pos.detach().cpu().numpy()} dpos_norm={torch.norm(dpos_L):.3f} grip={grip_L.item()}"
-                )
-
-        # Scale and clamp for visibility
-        speed_gain = 6.0
-        max_delta = 0.25
-        dpos_L = torch.clamp(dpos_L * speed_gain, -max_delta, max_delta)
-        dpos_R = torch.clamp(dpos_R * speed_gain, -max_delta, max_delta)
-
-        action_left = torch.cat([dpos_L, dquat_L, grip_L])
-        action_right = torch.cat([dpos_R, dquat_R, grip_R])
-
-        # Not complete yet
-        skill_complete = 0
-        return torch.stack([action_left, action_right]).unsqueeze(0), skill_complete
-
-    def get_assembly_action_v1_backup(self) -> torch.Tensor:
         """Scripted furniture assembly logic.
 
         Returns:
@@ -1968,5 +1869,4 @@ class FurnitureSimEnv(gym.Env):
             ).to(self.device)
         action = torch.concat([delta_pos, delta_quat, gripper])
         return action.unsqueeze(0), skill_complete
-        
         
