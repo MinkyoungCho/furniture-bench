@@ -1508,28 +1508,211 @@ class FurnitureSimEnv(gym.Env):
 
     def get_assembly_action(self) -> torch.Tensor:
         """
-        DO NOTHING SCRIPT (MULTI-ARM): Commands both arms to hold position.
-        This adapts the simple, effective "do nothing" command from the single-arm
-        version to the multi-arm environment.
+        GRASP & ATTACH LEG SCRIPT (MULTI-ARM):
+        - Left arm grasps the table edge and holds it steady.
+        - Right arm finds the closest leg, picks it up, and attaches it to the table.
         """
-        # Define a "do nothing" action for a single arm
-        delta_pos = torch.zeros(3, device=self.device)
-        delta_quat = torch.tensor([0, 0, 0, 1], device=self.device)
-        gripper = torch.tensor([-1], device=self.device)
+        # === FSM & Debug Initialization ===
+        if not hasattr(self, "fsm_phase"):
+            # Left arm FSM
+            self.fsm_phase = 0
+            self.fsm_step = 0
+            print("[FSM_L] Initializing GRASP_LIFT Controller. Phase 0: GET_GRASP_TARGET.")
+            # Right arm FSM
+            self.fsm_phase_R = 0
+            self.fsm_step_R = 0
+            print("[FSM_R] Right Arm IDLE.")
+
+        self.fsm_step += 1
+        self.fsm_step_R += 1
+        debug_tick = (self.fsm_step % 60) == 0
+
+        # === Get Current State ===
+        ee_pos_left, ee_quat_left = self.get_ee_pose(arm_idx=0)
+        ee_pos_right, ee_quat_right = self.get_ee_pose(arm_idx=1)
+
+        # === Default Actions ===
+        dpos_L, dquat_L, grip_L = torch.zeros(3, device=self.device), torch.tensor([0, 0, 0, 1], device=self.device), torch.tensor([-1], device=self.device)
+        dpos_R, dquat_R, grip_R = torch.zeros(3, device=self.device), torch.tensor([0, 0, 0, 1], device=self.device), torch.tensor([-1], device=self.device)
+
+        # === Helper Function for Movement ===
+        def move_to_target(target_pos, current_pos, current_phase, next_phase, debug_str):
+            error = target_pos - current_pos
+            distance = torch.norm(error)
+
+            if distance > 0.01:
+                dpos = 0.01 * error / distance # Move 1cm per step
+                if debug_tick: print(f"[{debug_str}] Dist: {distance:.3f} m")
+                return dpos, current_phase, False
+            else:
+                print(f"[FSM] Reached {debug_str}. Transitioning to Phase {next_phase}.")
+                return torch.zeros(3, device=self.device), next_phase, True
+
+        def quat_inverse(q):
+            # Operates on a torch.Tensor
+            return torch.tensor([-q[0], -q[1], -q[2], q[3]], device=q.device)
+
+        # === Left Arm FSM ===
+        # Phase 0: GET_GRASP_TARGET -> Phase 1: GOTO_PRE_GRASP -> Phase 2: DESCEND_TO_GRASP -> Phase 3: GRASP -> Phase 4: HOLD
+        if self.fsm_phase == 0:
+            part_to_find = "square_table_top"
+            part_idx = next((i for i, part in enumerate(self.furniture.parts) if part.name == part_to_find), -1)
+            if part_idx != -1:
+                all_parts_poses, _ = self._get_parts_poses(sim_coord=True)
+                part_pose_flat = all_parts_poses.squeeze(0)
+                pose_start_idx = part_idx * 7
+                part_pos_world = part_pose_flat[pose_start_idx:pose_start_idx+3]
+                part_quat_world = part_pose_flat[pose_start_idx+3:pose_start_idx+7]
+                part_rot_mat_world_np = T.quat2mat(part_quat_world.cpu().numpy())
+                part_rot_mat_world = torch.from_numpy(part_rot_mat_world_np).to(self.device).float()
+                
+                table_half_width = 0.1625 / 2
+                grasp_offset_local = torch.tensor([0, 0, -table_half_width], device=self.device)
+                grasp_pos_world = part_pos_world + part_rot_mat_world @ grasp_offset_local
+                pre_grasp_pos_world = grasp_pos_world + torch.tensor([0, 0, 0.10], device=self.device)
+
+                base_pos_world_left = self.rb_states[self.base_idxs[0], :3]
+                self.fsm_pre_grasp_pos = pre_grasp_pos_world - base_pos_world_left
+                self.fsm_grasp_pos = grasp_pos_world - base_pos_world_left
+                
+                print(f"[FSM_L] Target Acquired for '{part_to_find}' edge.")
+                self.fsm_phase = 1
+            else:
+                self.fsm_phase = 4 # HOLD if part not found
+
+        elif self.fsm_phase == 1:
+            dpos_L, self.fsm_phase, _ = move_to_target(self.fsm_pre_grasp_pos, ee_pos_left, 1, 2, "GOTO_PRE_GRASP")
         
-        # Assemble the action for one arm
-        single_arm_action = torch.cat([delta_pos, delta_quat, gripper])
+        elif self.fsm_phase == 2:
+            dpos_L, self.fsm_phase, _ = move_to_target(self.fsm_grasp_pos, ee_pos_left, 2, 3, "DESCEND_TO_GRASP")
 
-        # Create a list of actions for all arms
-        actions = [single_arm_action for _ in range(self.num_arms)]
+        elif self.fsm_phase == 3:
+            grip_L = torch.tensor([1.0], device=self.device)
+            if self.fsm_step == 0: print("[FSM_L] Closing gripper.")
+            if self.fsm_step > 30:
+                print("[FSM_L] Grasp complete. Transitioning to HOLD.")
+                self.fsm_phase = 4
+                self.fsm_step = 0
+        
+        elif self.fsm_phase == 4:
+            grip_L = torch.tensor([1.0], device=self.device)
+            if debug_tick: print(f"[FSM_L] HOLDING table edge.")
 
-        # Stack the actions for all arms
-        multi_arm_action = torch.stack(actions)
+        # === Right Arm FSM ===
+        if self.fsm_phase_R == 0 and self.fsm_phase == 4: # If left arm is holding
+             print("[FSM_R] Left arm holding, right arm starting.")
+             self.fsm_phase_R = 1
 
-        # The skill is never complete, so we return 0
+        if self.fsm_phase_R == 1:
+            print("[FSM_R] Phase 1: Planning leg attachment.")
+            # Find closest leg
+            leg_parts = [(i, p) for i, p in enumerate(self.furniture.parts) if "leg" in p.name]
+            all_parts_poses, _ = self._get_parts_poses(sim_coord=True)
+            part_pose_flat = all_parts_poses.squeeze(0)
+            base_pos_world_right = self.rb_states[self.base_idxs[1], :3]
+
+            min_dist = float('inf')
+            leg_pos_world = None
+            for i, part in leg_parts:
+                pose_start_idx = i * 7
+                current_leg_pos_world = part_pose_flat[pose_start_idx:pose_start_idx+3]
+                dist = torch.norm(current_leg_pos_world - base_pos_world_right)
+                if dist < min_dist:
+                    min_dist = dist
+                    self.fsm_R_target_leg_part_idx = i
+                    self.fsm_R_target_leg_name = part.name
+                    leg_pos_world = current_leg_pos_world
+            
+            print(f"[FSM_R] Closest leg is '{self.fsm_R_target_leg_name}'.")
+
+            # Calculate leg waypoints
+            self.fsm_R_leg_grasp_pos = leg_pos_world - base_pos_world_right
+            self.fsm_R_leg_pre_grasp_pos = self.fsm_R_leg_grasp_pos + torch.tensor([0, 0, 0.10], device=self.device)
+            self.fsm_R_leg_post_grasp_pos = self.fsm_R_leg_grasp_pos + torch.tensor([0, 0, 0.10], device=self.device)
+
+            # Calculate hole waypoints and orientation
+            table_top_part_idx = next((i for i, p in enumerate(self.furniture.parts) if p.name == "square_table_top"), 0)
+            pose_start_idx = table_top_part_idx * 7
+            table_top_pos_world = part_pose_flat[pose_start_idx:pose_start_idx+3]
+            table_top_quat_world = part_pose_flat[pose_start_idx+3:pose_start_idx+7]
+            table_top_rot_mat_np = T.quat2mat(table_top_quat_world.cpu().numpy())
+            table_top_rot_mat = torch.from_numpy(table_top_rot_mat_np).to(self.device).float()
+
+            rel_hole_pose_mat = torch.from_numpy(self.furniture.assembled_rel_poses[(0, self.fsm_R_target_leg_part_idx)][0]).to(self.device).float()
+            
+            table_top_pose_world_mat = torch.eye(4, device=self.device)
+            table_top_pose_world_mat[:3,:3] = table_top_rot_mat
+            table_top_pose_world_mat[:3,3] = table_top_pos_world
+
+            hole_pose_world_mat = table_top_pose_world_mat @ rel_hole_pose_mat
+            hole_pos_world = hole_pose_world_mat[:3, 3]
+            
+            leg_target_rot_mat_np = hole_pose_world_mat[:3, :3].cpu().numpy()
+            leg_target_quat = torch.from_numpy(T.mat2quat(leg_target_rot_mat_np)).to(self.device).float()
+            
+            gripper_offset_quat = torch.tensor([0.707, 0, 0, 0.707], device=self.device)
+            self.fsm_R_insert_quat = C.quat_mul(leg_target_quat, gripper_offset_quat)
+
+            self.fsm_R_hole_insert_pos = hole_pos_world - base_pos_world_right
+            self.fsm_R_hole_pre_insert_pos = self.fsm_R_hole_insert_pos + torch.tensor([0, 0, 0.10], device=self.device)
+            self.fsm_R_retreat_pos = self.fsm_R_hole_pre_insert_pos
+            
+            print("[FSM_R] Path successfully planned.")
+            self.fsm_phase_R = 2
+            self.fsm_step_R = 0
+
+        elif self.fsm_phase_R == 2: # GOTO_LEG_PRE_GRASP
+            dpos_R, self.fsm_phase_R, reached = move_to_target(self.fsm_R_leg_pre_grasp_pos, ee_pos_right, 2, 3, "R:GOTO_LEG_PRE_GRASP")
+            if reached: self.fsm_step_R = 0
+        elif self.fsm_phase_R == 3: # DESCEND_TO_LEG
+            dpos_R, self.fsm_phase_R, reached = move_to_target(self.fsm_R_leg_grasp_pos, ee_pos_right, 3, 4, "R:DESCEND_TO_LEG")
+            if reached: self.fsm_step_R = 0
+        elif self.fsm_phase_R == 4: # GRASP_LEG
+            grip_R = torch.tensor([1.0], device=self.device)
+            if self.fsm_step_R == 0: print("[FSM_R] Closing gripper on leg.")
+            if self.fsm_step_R > 30:
+                print("[FSM_R] Grasp complete. Lifting leg.")
+                self.fsm_phase_R = 5
+                self.fsm_step_R = 0
+        elif self.fsm_phase_R == 5: # LIFT_LEG
+            grip_R = torch.tensor([1.0], device=self.device)
+            dpos_R, self.fsm_phase_R, reached = move_to_target(self.fsm_R_leg_post_grasp_pos, ee_pos_right, 5, 6, "R:LIFT_LEG")
+            if reached: self.fsm_step_R = 0
+        elif self.fsm_phase_R == 6: # GOTO_HOLE_PRE_INSERT
+            grip_R = torch.tensor([1.0], device=self.device)
+            dpos_R, self.fsm_phase_R, reached = move_to_target(self.fsm_R_hole_pre_insert_pos, ee_pos_right, 6, 7, "R:GOTO_HOLE_PRE_INSERT")
+            if reached: self.fsm_step_R = 0
+        elif self.fsm_phase_R == 7: # DESCEND_TO_INSERT
+            grip_R = torch.tensor([1.0], device=self.device)
+            dpos_R, self.fsm_phase_R, reached = move_to_target(self.fsm_R_hole_insert_pos, ee_pos_right, 7, 8, "R:DESCEND_TO_INSERT")
+            if reached: self.fsm_step_R = 0
+        elif self.fsm_phase_R == 8: # RELEASE_LEG
+            grip_R = torch.tensor([-1.0], device=self.device) # Open gripper
+            if self.fsm_step_R == 0: print("[FSM_R] Releasing leg.")
+            if self.fsm_step_R > 30:
+                print("[FSM_R] Release complete. Retreating.")
+                self.fsm_phase_R = 9
+                self.fsm_step_R = 0
+        elif self.fsm_phase_R == 9: # RETREAT
+            dpos_R, self.fsm_phase_R, reached = move_to_target(self.fsm_R_retreat_pos, ee_pos_right, 9, 10, "R:RETREAT")
+            if reached: self.fsm_step_R = 0
+        elif self.fsm_phase_R == 10: # HOLD
+            if debug_tick: print("[FSM_R] Assembly complete. Holding.")
+        
+
+        # === Assemble and Return Action ===
+        if self.fsm_phase_R >= 6 and self.fsm_phase_R < 8:
+             q_target_R = self.fsm_R_insert_quat
+             q_current_R = ee_quat_right
+             if torch.dot(q_target_R, q_current_R) < 0:
+                 q_current_R = -q_current_R
+             
+             dquat_R = C.quat_mul(q_target_R, quat_inverse(q_current_R))
+        
+        action_left = torch.cat([dpos_L, dquat_L, grip_L])
+        action_right = torch.cat([dpos_R, dquat_R, grip_R])
+        multi_arm_action = torch.stack([action_left, action_right])
         skill_complete = 0
-        
-        # Unsqueeze to add the environment dimension (num_envs=1)
         return multi_arm_action.unsqueeze(0), skill_complete
         
         

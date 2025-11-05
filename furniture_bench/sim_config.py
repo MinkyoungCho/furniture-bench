@@ -93,7 +93,7 @@ def default_asset_options():
 # Volume: 302802 mm^3
 # Mass: 151g
 square_table_top_asset_options = default_asset_options()
-square_table_top_asset_options.density = 498.68
+square_table_top_asset_options.density = 198.68 # 4968.68 for original
 sim_config["asset"]["square_table_top"] = square_table_top_asset_options
 
 # Volume: 62435.mm^3
