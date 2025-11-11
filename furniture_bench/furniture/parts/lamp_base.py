@@ -123,18 +123,16 @@ class LampBase(Part):
                 self.prev_pose = target
                 next_state = "push"
         elif self._state == "push":
-            target_pos = torch.zeros((4,), device=device)
-            target_pos[-1] = 1
-            for name in ["obstacle_front", "obstacle_right", "obstacle_left"]:
-                obstacle_pos = torch.cat(
-                    [
-                        rb_states[part_idxs[name]][0][:3],
-                        torch.tensor([1.0], device=device),
-                    ]
-                )
-                target_pos[0] = max(obstacle_pos[0], target_pos[0])
-                target_pos[1] = max(obstacle_pos[1], target_pos[1])
-            target_pos = april_to_robot @ sim_to_april_mat @ target_pos
+            # Use franka2's end-effector position instead of obstacles
+            franka2_ee_pos = torch.cat(
+                [
+                    rb_states[part_idxs["franka2_ee"]][0][:3],
+                    torch.tensor([1.0], device=device),
+                ]
+            )
+            # Convert franka2 position to AprilTag coordinate, then to robot coordinate
+            target_pos = april_to_robot @ sim_to_april_mat @ franka2_ee_pos
+            # Position base relative to franka2's gripper (adjust for grasping)
             target_pos[0] -= self.half_length * 2 + 0.02
             target_pos[1] -= self.half_length + 0.02  # Margin 2cm
             target_pos[2] = ee_pose[2, 3]  # Keep z the same.

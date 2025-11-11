@@ -202,15 +202,26 @@ class FurnitureSimEnv(gym.Env):
     def create_envs(self):
         table_pos = gymapi.Vec3(0.8, 0.8, 0.4)
         self.franka_pose = gymapi.Transform()
+        self.franka2_pose = gymapi.Transform()  # Second robot on left side
 
         table_half_width = 0.015
         table_surface_z = table_pos.z + table_half_width
+        # First robot (right side, original position)
         self.franka_pose.p = gymapi.Vec3(
             0.5 * -table_pos.x + 0.1, 0, table_surface_z + ROBOT_HEIGHT
+        )
+        # Second robot (left edge of table)
+        self.franka2_pose.p = gymapi.Vec3(
+        #    0.5 * -table_pos.x + 0.1, 0, table_surface_z + ROBOT_HEIGHT
+           -0.1, 0.5 * table_pos.y - 0.1, table_surface_z + ROBOT_HEIGHT
         )
 
         self.franka_from_origin_mat = get_mat(
             [self.franka_pose.p.x, self.franka_pose.p.y, self.franka_pose.p.z],
+            [0, 0, 0],
+        )
+        self.franka2_from_origin_mat = get_mat(
+            [self.franka2_pose.p.x, self.franka2_pose.p.y, self.franka2_pose.p.z],
             [0, 0, 0],
         )
         self.base_tag_from_robot_mat = config["robot"]["tag_base_from_robot_base"]
@@ -242,6 +253,17 @@ class FurnitureSimEnv(gym.Env):
         self.base_idxs = []
         self.part_idxs = {}
         self.franka_handles = []
+        
+        # Second robot variables
+        self.ee2_idxs = []
+        self.ee2_handles = []
+        self.osc2_ctrls = []
+        self.base2_idxs = []
+        self.franka2_handles = []
+        self.last_grasp2 = torch.tensor([-1.0] * self.num_envs, device=self.device)
+        # Store base_tag positions per environment for calculating obstacle position
+        self.base_tag_positions = []
+        self.table_surface_z = table_pos.z + table_half_width
         for i in range(self.num_envs):
             env = self.isaac_gym.create_env(self.sim, env_lower, env_upper, num_per_row)
             self.envs.append(env)
@@ -269,54 +291,61 @@ class FurnitureSimEnv(gym.Env):
             base_tag_handle = self.isaac_gym.create_actor(
                 env, self.base_tag_asset, self.base_tag_pose, "base_tag", i, 0
             )
+            # Store base_tag position for calculating obstacle target position
+            self.base_tag_positions.append(gymapi.Vec3(
+                self.base_tag_pose.p.x,
+                self.base_tag_pose.p.y,
+                self.base_tag_pose.p.z
+            ))
             bg_pos = gymapi.Vec3(-0.8, 0, 0.75)
             bg_pose = gymapi.Transform()
             bg_pose.p = gymapi.Vec3(bg_pos.x, bg_pos.y, bg_pos.z)
             bg_handle = self.isaac_gym.create_actor(
                 env, self.background_asset, bg_pose, "background", i, 0
             )
+            # Obstacles removed - franka2 will hold the base instead
             # TODO: Make config
-            obstacle_pose = gymapi.Transform()
-            obstacle_pose.p = gymapi.Vec3(
-                self.base_tag_pose.p.x + 0.37 + 0.01, 0.0, table_surface_z + 0.015
-            )
-            obstacle_pose.r = gymapi.Quat.from_axis_angle(
-                gymapi.Vec3(0, 0, 1), 0.5 * np.pi
-            )
+            # obstacle_pose = gymapi.Transform()
+            # obstacle_pose.p = gymapi.Vec3(
+            #     self.base_tag_pose.p.x + 0.37 + 0.01, 0.0, table_surface_z + 0.015
+            # )
+            # obstacle_pose.r = gymapi.Quat.from_axis_angle(
+            #     gymapi.Vec3(0, 0, 1), 0.5 * np.pi
+            # )
 
-            obstacle_handle = self.isaac_gym.create_actor(
-                env, self.obstacle_front_asset, obstacle_pose, f"obstacle_front", i, 0
-            )
-            part_idx = self.isaac_gym.get_actor_rigid_body_index(
-                env, obstacle_handle, 0, gymapi.DOMAIN_SIM
-            )
-            if self.part_idxs.get("obstacle_front") is None:
-                self.part_idxs["obstacle_front"] = [part_idx]
-            else:
-                self.part_idxs[f"obstacle_front"].append(part_idx)
+            # obstacle_handle = self.isaac_gym.create_actor(
+            #     env, self.obstacle_front_asset, obstacle_pose, f"obstacle_front", i, 0
+            # )
+            # part_idx = self.isaac_gym.get_actor_rigid_body_index(
+            #     env, obstacle_handle, 0, gymapi.DOMAIN_SIM
+            # )
+            # if self.part_idxs.get("obstacle_front") is None:
+            #     self.part_idxs["obstacle_front"] = [part_idx]
+            # else:
+            #     self.part_idxs[f"obstacle_front"].append(part_idx)
 
-            for j, name in enumerate(["obstacle_right", "obstacle_left"]):
-                y = -0.175 if j == 0 else 0.175
-                obstacle_pose = gymapi.Transform()
-                obstacle_pose.p = gymapi.Vec3(
-                    self.base_tag_pose.p.x + 0.37 + 0.01 - 0.075,
-                    y,
-                    table_surface_z + 0.015,
-                )
-                obstacle_pose.r = gymapi.Quat.from_axis_angle(
-                    gymapi.Vec3(0, 0, 1), 0.5 * np.pi
-                )
+            # for j, name in enumerate(["obstacle_right", "obstacle_left"]):
+            #     y = -0.175 if j == 0 else 0.175
+            #     obstacle_pose = gymapi.Transform()
+            #     obstacle_pose.p = gymapi.Vec3(
+            #         self.base_tag_pose.p.x + 0.37 + 0.01 - 0.075,
+            #         y,
+            #         table_surface_z + 0.015,
+            #     )
+            #     obstacle_pose.r = gymapi.Quat.from_axis_angle(
+            #         gymapi.Vec3(0, 0, 1), 0.5 * np.pi
+            #     )
 
-                obstacle_handle = self.isaac_gym.create_actor(
-                    env, self.obstacle_side_asset, obstacle_pose, name, i, 0
-                )
-                part_idx = self.isaac_gym.get_actor_rigid_body_index(
-                    env, obstacle_handle, 0, gymapi.DOMAIN_SIM
-                )
-                if self.part_idxs.get(name) is None:
-                    self.part_idxs[name] = [part_idx]
-                else:
-                    self.part_idxs[name].append(part_idx)
+            #     obstacle_handle = self.isaac_gym.create_actor(
+            #         env, self.obstacle_side_asset, obstacle_pose, name, i, 0
+            #     )
+            #     part_idx = self.isaac_gym.get_actor_rigid_body_index(
+            #         env, obstacle_handle, 0, gymapi.DOMAIN_SIM
+            #     )
+            #     if self.part_idxs.get(name) is None:
+            #         self.part_idxs[name] = [part_idx]
+            #     else:
+            #         self.part_idxs[name].append(part_idx)
             # Add robot.
             franka_handle = self.isaac_gym.create_actor(
                 env, self.franka_asset, self.franka_pose, "franka", i, 0
@@ -379,6 +408,46 @@ class FurnitureSimEnv(gym.Env):
             self.isaac_gym.set_actor_dof_states(
                 env, franka_handle, default_dof_state, gymapi.STATE_ALL
             )
+            
+            # Add second robot (left side of table)
+            franka2_handle = self.isaac_gym.create_actor(
+                env, self.franka_asset, self.franka2_pose, "franka2", i, 0
+            )
+            self.isaac_gym.enable_actor_dof_force_sensors(env, franka2_handle)
+            self.franka2_handles.append(franka2_handle)
+
+            # Get global index of hand and base for second robot
+            self.ee2_idxs.append(
+                self.isaac_gym.get_actor_rigid_body_index(
+                    env, franka2_handle, self.franka_ee_index, gymapi.DOMAIN_SIM
+                )
+            )
+            self.ee2_handles.append(
+                self.isaac_gym.find_actor_rigid_body_handle(
+                    env, franka2_handle, "k_ee_link"
+                )
+            )
+            self.base2_idxs.append(
+                self.isaac_gym.get_actor_rigid_body_index(
+                    env, franka2_handle, self.franka_base_index, gymapi.DOMAIN_SIM
+                )
+            )
+            
+            # Add franka2 end-effector to part_idxs so it can be accessed like obstacles
+            if self.part_idxs.get("franka2_ee") is None:
+                self.part_idxs["franka2_ee"] = [self.ee2_idxs[i]]
+            else:
+                self.part_idxs["franka2_ee"].append(self.ee2_idxs[i])
+            
+            # Set dof properties for second robot (same as first)
+            self.isaac_gym.set_actor_dof_properties(
+                env, franka2_handle, franka_dof_props
+            )
+            # Set initial dof states for second robot
+            self.isaac_gym.set_actor_dof_states(
+                env, franka2_handle, default_dof_state, gymapi.STATE_ALL
+            )
+            
             # Add furniture parts.
             poses = []
             for part in self.furniture.parts:
@@ -421,10 +490,12 @@ class FurnitureSimEnv(gym.Env):
         
         # print(f'Getting the separate actor indices for the frankas and the furniture parts (not the handles)')
         self.franka_actor_idx_all = []
+        self.franka2_actor_idx_all = []
         self.part_actor_idx_all = []  # global list of indices, when resetting all parts
         self.part_actor_idx_by_env = {}  # allow to access part indices based on environment indices
         for env_idx in range(self.num_envs):
             self.franka_actor_idx_all.append(self.isaac_gym.find_actor_index(self.envs[env_idx], 'franka', gymapi.DOMAIN_SIM))
+            self.franka2_actor_idx_all.append(self.isaac_gym.find_actor_index(self.envs[env_idx], 'franka2', gymapi.DOMAIN_SIM))
             self.part_actor_idx_by_env[env_idx] = []
             for part in self.furnitures[env_idx].parts:
                 part_actor_idx = self.isaac_gym.find_actor_index(self.envs[env_idx], part.name, gymapi.DOMAIN_SIM)
@@ -432,6 +503,7 @@ class FurnitureSimEnv(gym.Env):
                 self.part_actor_idx_by_env[env_idx].append(part_actor_idx)
 
         self.franka_actor_idxs_all_t = torch.tensor(self.franka_actor_idx_all, device=self.device, dtype=torch.int32)
+        self.franka2_actor_idxs_all_t = torch.tensor(self.franka2_actor_idx_all, device=self.device, dtype=torch.int32)
         self.part_actor_idxs_all_t = torch.tensor(self.part_actor_idx_all, device=self.device, dtype=torch.int32)
 
     def _get_reset_pose(self, part: Part):
@@ -594,16 +666,18 @@ class FurnitureSimEnv(gym.Env):
 
         _forces = self.isaac_gym.acquire_dof_force_tensor(self.sim)
         _forces = gymtorch.wrap_tensor(_forces)
-        self.forces = _forces.view(self.num_envs, 9)
+        # With two robots, we have 18 DOFs per environment
+        self.forces = _forces.view(self.num_envs, 18)
 
         # Get DoF tensor
         _dof_states = self.isaac_gym.acquire_dof_state_tensor(self.sim)
         self.dof_states = gymtorch.wrap_tensor(
             _dof_states
         )  # (num_dofs, 2), 2 for pos and vel.
-        self.dof_pos = self.dof_states[:, 0].view(self.num_envs, 9)
-        self.dof_vel = self.dof_states[:, 1].view(self.num_envs, 9)
-        # Get jacobian tensor
+        # With two robots, we have 18 DOFs per environment (9 per robot)
+        self.dof_pos = self.dof_states[:, 0].view(self.num_envs, 18)
+        self.dof_vel = self.dof_states[:, 1].view(self.num_envs, 18)
+        # Get jacobian tensor for first robot
         # for fixed-base franka, tensor has shape (num envs, 10, 6, 9)
         _jacobian = self.isaac_gym.acquire_jacobian_tensor(self.sim, "franka")
         self.jacobian = gymtorch.wrap_tensor(_jacobian)
@@ -611,10 +685,19 @@ class FurnitureSimEnv(gym.Env):
         self.jacobian_eef = self.jacobian[
             :, self.franka_ee_index - 1, :, :7
         ]  # -1 due to finxed base link.
-        # Prepare mass matrix tensor
+        # Get jacobian tensor for second robot
+        _jacobian2 = self.isaac_gym.acquire_jacobian_tensor(self.sim, "franka2")
+        self.jacobian2 = gymtorch.wrap_tensor(_jacobian2)
+        self.jacobian_eef2 = self.jacobian2[
+            :, self.franka_ee_index - 1, :, :7
+        ]
+        # Prepare mass matrix tensor for first robot
         # For franka, tensor shape is (num_envs, 7 + 2, 7 + 2), 2 for grippers.
         _massmatrix = self.isaac_gym.acquire_mass_matrix_tensor(self.sim, "franka")
         self.mm = gymtorch.wrap_tensor(_massmatrix)
+        # Mass matrix for second robot
+        _massmatrix2 = self.isaac_gym.acquire_mass_matrix_tensor(self.sim, "franka2")
+        self.mm2 = gymtorch.wrap_tensor(_massmatrix2)
 
     def april_coord_to_sim_coord(self, april_coord_mat):
         """Converts AprilTag coordinate to simulator base_tag coordinate."""
@@ -731,8 +814,9 @@ class FurnitureSimEnv(gym.Env):
         )
         if not self.ctrl_started:
             self.init_ctrl()
-        # Set the goal
+        # Set the goal for both robots
         ee_pos, ee_quat = self.get_ee_pose()
+        ee2_pos, ee2_quat = self.get_ee2_pose()
 
         for env_idx in range(self.num_envs):
             if self.act_rot_repr == "quat":
@@ -747,19 +831,88 @@ class FurnitureSimEnv(gym.Env):
             else:
                 action_quat = C.axisangle2quat(action[env_idx][3:6])
 
+            # First robot
             self.osc_ctrls[env_idx].set_goal(
                 action[env_idx][:3] + ee_pos[env_idx],
                 C.quat_multiply(ee_quat[env_idx], action_quat).to(self.device),
             )
+            # Second robot - move to obstacle position first, then grasp lamp base when it arrives
+            furniture = self.furnitures[env_idx] if hasattr(self, 'furnitures') else self.furniture
+            lamp_base_part = None
+            for part in furniture.parts:
+                if part.name == "lamp_base":
+                    lamp_base_part = part
+                    break
+            
+            # Calculate obstacle target position from base_tag position
+            base_tag_pos = self.base_tag_positions[env_idx]
+            obstacle_target_world = torch.tensor([
+                base_tag_pos.x + 0.37 + 0.01,
+                0.0,
+                self.table_surface_z + 0.015
+            ], device=self.device)
+            
+            # Get franka2's base position in world coordinates
+            franka2_base_world = self.rb_states[self.base2_idxs[env_idx], :3]
+            
+            # Set orientation: gripper parallel to ground (horizontal)
+            gripper_ori_ground = torch.tensor([0.707, 0, 0, 0.707], device=self.device)  # Quaternion for 90 deg rotation around x-axis
+            
+            if lamp_base_part is not None:
+                # Check if lamp_base is in push state (franka is pushing base forward)
+                if lamp_base_part._state in ["push", "push_x"]:
+                    # When franka is pushing, franka2 should be at obstacle position ready to grasp
+                    obstacle_target_rel = obstacle_target_world - franka2_base_world
+                    self.osc2_ctrls[env_idx].set_goal(
+                        obstacle_target_rel,
+                        gripper_ori_ground,
+                    )
+                elif lamp_base_part._state == "release":
+                    # When base is released, franka2 should grasp it
+                    # Get lamp_base position in world coordinates
+                    if "lamp_base" in self.part_idxs and len(self.part_idxs["lamp_base"]) > env_idx:
+                        lamp_base_idx = self.part_idxs["lamp_base"][env_idx]
+                        lamp_base_pos = self.rb_states[lamp_base_idx, :3]
+                        # Position franka2's gripper to grasp the base (slightly above and in front)
+                        grasp_target = lamp_base_pos.clone()
+                        grasp_target[2] += 0.02  # Slightly above
+                        grasp_target_rel = grasp_target - franka2_base_world
+                        self.osc2_ctrls[env_idx].set_goal(
+                            grasp_target_rel,
+                            gripper_ori_ground,
+                        )
+                    else:
+                        # Fallback: move to obstacle position
+                        obstacle_target_rel = obstacle_target_world - franka2_base_world
+                        self.osc2_ctrls[env_idx].set_goal(
+                            obstacle_target_rel,
+                            gripper_ori_ground,
+                        )
+                else:
+                    # Before push state: move franka2 to obstacle position (serving as obstacle)
+                    obstacle_target_rel = obstacle_target_world - franka2_base_world
+                    self.osc2_ctrls[env_idx].set_goal(
+                        obstacle_target_rel,
+                        gripper_ori_ground,
+                    )
+            else:
+                # No lamp_base part found, move to obstacle position
+                obstacle_target_rel = obstacle_target_world - franka2_base_world
+                self.osc2_ctrls[env_idx].set_goal(
+                    obstacle_target_rel,
+                    gripper_ori_ground,
+                )
 
         for _ in range(sim_steps):
             self.refresh()
 
             pos_action = torch.zeros_like(self.dof_pos)
             torque_action = torch.zeros_like(self.dof_pos)
-            grip_action = torch.zeros((self.num_envs, 1))
+            grip_action = torch.zeros((self.num_envs, 2))  # Two grippers
             for env_idx in range(self.num_envs):
                 grasp = action[env_idx, -1]
+                
+                # First robot gripper
                 if (
                     torch.sign(grasp) != torch.sign(self.last_grasp[env_idx])
                     and torch.abs(grasp) > self.grasp_margin
@@ -767,14 +920,30 @@ class FurnitureSimEnv(gym.Env):
                     grip_sep = self.max_gripper_width if grasp < 0 else 0.0
                     self.last_grasp[env_idx] = grasp
                 else:
-                    # Keep the gripper open if the grasp has not changed
                     if self.last_grasp[env_idx] < 0:
                         grip_sep = self.max_gripper_width
                     else:
                         grip_sep = 0.0
+                grip_action[env_idx, 0] = grip_sep
+                
+                # Second robot gripper - close when grasping lamp base
+                furniture = self.furnitures[env_idx] if hasattr(self, 'furnitures') else self.furniture
+                lamp_base_part = None
+                for part in furniture.parts:
+                    if part.name == "lamp_base":
+                        lamp_base_part = part
+                        break
+                
+                # Close gripper when in release state (base is being released by franka)
+                if lamp_base_part is not None and lamp_base_part._state == "release":
+                    # Close gripper to grasp
+                    grip_action[env_idx, 1] = 0.0  # Closed
+                else:
+                    # Keep gripper open or maintain current state
+                    current_gripper2 = self.dof_pos[env_idx, 16:17] + self.dof_pos[env_idx, 17:18]
+                    grip_action[env_idx, 1] = current_gripper2
 
-                grip_action[env_idx, -1] = grip_sep
-
+                # First robot control
                 state_dict = {}
                 ee_pos, ee_quat = self.get_ee_pose()
                 state_dict["ee_pose"] = C.pose2mat(
@@ -792,16 +961,40 @@ class FurnitureSimEnv(gym.Env):
                     "joint_torques"
                 ]
 
+                # Second robot control - keep it stationary
+                state_dict2 = {}
+                ee2_pos, ee2_quat = self.get_ee2_pose()
+                state_dict2["ee_pose"] = C.pose2mat(
+                    ee2_pos[env_idx], ee2_quat[env_idx], self.device
+                ).t()
+                state_dict2["joint_positions"] = self.dof_pos[env_idx][9:16]  # DOFs 9-15 for second robot
+                state_dict2["joint_velocities"] = self.dof_vel[env_idx][9:16]
+                state_dict2["mass_matrix"] = self.mm2[env_idx][
+                    :7, :7
+                ].t()
+                state_dict2["jacobian"] = self.jacobian_eef2[
+                    env_idx
+                ].t()
+                torque_action[env_idx, 9:16] = self.osc2_ctrls[env_idx](state_dict2)[
+                    "joint_torques"
+                ]
+                # Keep franka2's gripper stationary (maintain current state)
+                # Don't update gripper based on action
+
+                # Gripper actions
                 if self.gripper_pos_control:
-                    grip_action[env_idx, -1] = grip_sep
+                    pos_action[env_idx, 7:9] = grip_action[env_idx, 0]
+                    pos_action[env_idx, 16:18] = grip_action[env_idx, 1]  # franka2 gripper stays at current position
                 else:
                     if grip_sep > 0:
                         torque_action[env_idx, 7:9] = sim_config["robot"]["gripper_torque"]
                     else:
                         torque_action[env_idx, 7:9] = -sim_config["robot"]["gripper_torque"]
-            # Gripper action
+                    # franka2 gripper - apply zero torque to keep it stationary
+                    torque_action[env_idx, 16:18] = 0.0
+            
+            # Apply actions
             if self.gripper_pos_control:
-                pos_action[:, 7:9] = grip_action
                 self.isaac_gym.set_dof_position_target_tensor(
                     self.sim, gymtorch.unwrap_tensor(pos_action)
                 )
@@ -928,9 +1121,10 @@ class FurnitureSimEnv(gym.Env):
             )
 
     def _read_robot_state(self):
+        # First robot state
         joint_positions = self.dof_pos[:, :7]
         joint_velocities = self.dof_vel[:, :7]
-        joint_torques = self.forces
+        joint_torques = self.forces[:, :9]  # First robot's forces (9 DOFs)
         ee_pos, ee_quat = self.get_ee_pose()
         for q in ee_quat:
             if q[3] < 0:
@@ -993,6 +1187,27 @@ class FurnitureSimEnv(gym.Env):
                     joint_kp=10,
                 )
             )
+        
+        # Initialize controllers for second robot
+        ee2_pos, ee2_quat = self.get_ee2_pose()
+        for env_idx in range(self.num_envs):
+            self.osc2_ctrls.append(
+                osc_factory(
+                    real_robot=False,
+                    ee_pos_current=ee2_pos[env_idx],
+                    ee_quat_current=ee2_quat[env_idx],
+                    init_joints=torch.tensor(
+                        config["robot"]["reset_joints"], device=self.device
+                    ),
+                    kp=kp,
+                    kv=kv,
+                    mass_matrix_offset_val=[0.0, 0.0, 0.0],
+                    position_limits=torch.tensor(
+                        config["robot"]["position_limits"], device=self.device
+                    ),
+                    joint_kp=10,
+                )
+            )
         self.ctrl_started = True
 
     def get_ee_pose(self):
@@ -1003,7 +1218,16 @@ class FurnitureSimEnv(gym.Env):
         base_quat = self.rb_states[self.base_idxs, 3:7]  # Align with world coordinate.
         return hand_pos - base_pos, hand_quat
 
+    def get_ee2_pose(self):
+        """Gets end-effector pose for second robot in world coordinate."""
+        hand_pos = self.rb_states[self.ee2_idxs, :3]
+        hand_quat = self.rb_states[self.ee2_idxs, 3:7]
+        base_pos = self.rb_states[self.base2_idxs, :3]
+        base_quat = self.rb_states[self.base2_idxs, 3:7]  # Align with world coordinate.
+        return hand_pos - base_pos, hand_quat
+
     def gripper_width(self):
+        # Return first robot's gripper width (for backward compatibility)
         return self.dof_pos[:, 7:8] + self.dof_pos[:, 8:9]
 
     def _done(self) -> bool:
@@ -1207,6 +1431,7 @@ class FurnitureSimEnv(gym.Env):
         
         if reset_franka:
             self._reset_franka(env_idx)
+            self._reset_franka2(env_idx)  # Reset second robot
         if reset_parts:
             self._reset_parts(env_idx)
         self.env_steps[env_idx] = 0
@@ -1277,6 +1502,23 @@ class FurnitureSimEnv(gym.Env):
             len(actor_idx),
         )
 
+    def _reset_franka2(self, env_idx, dof_pos=None):
+        """
+        Resets second Franka actor within a single env.
+        """
+        self._update_franka_dof_state_buffer(dof_pos=dof_pos)
+        
+        # Update second robot's DOF states (DOFs 9-17 for this env)
+        # Note: DOF states are organized as (env_idx * num_dofs_per_env + robot_offset + dof_idx)
+        # For now, we'll update the DOF states for the second robot
+        actor_idx = self.franka2_actor_idxs_all_t[env_idx].reshape(1, 1)
+        self.isaac_gym.set_dof_state_tensor_indexed(
+            self.sim,
+            gymtorch.unwrap_tensor(self.dof_states),
+            gymtorch.unwrap_tensor(actor_idx),
+            len(actor_idx),
+        )
+
     def _reset_franka_all(self, dof_pos=None):
         """
         Resets all Franka actors across all envs
@@ -1289,6 +1531,14 @@ class FurnitureSimEnv(gym.Env):
             gymtorch.unwrap_tensor(self.dof_states),
             gymtorch.unwrap_tensor(self.franka_actor_idxs_all_t),
             len(self.franka_actor_idxs_all_t),
+        )
+        
+        # Also reset all second robots
+        self.isaac_gym.set_dof_state_tensor_indexed(
+            self.sim,
+            gymtorch.unwrap_tensor(self.dof_states),
+            gymtorch.unwrap_tensor(self.franka2_actor_idxs_all_t),
+            len(self.franka2_actor_idxs_all_t),
         )
 
     def _reset_parts(self, env_idx, parts_poses=None, skip_set_state=False):
@@ -1421,6 +1671,7 @@ class FurnitureSimEnv(gym.Env):
         Returns:
             Tuple (action for the assembly task, skill complete mask)
         """
+        print ('************* Hello get_assembly_action *************')
         assert self.num_envs == 1  # Only support one environment for now.
         if self.furniture_name not in ["one_leg", "cabinet", "lamp", "round_table"]:
             raise NotImplementedError("[one_leg, cabinet, lamp, round_table] are supported for scripted agent")
@@ -1434,6 +1685,7 @@ class FurnitureSimEnv(gym.Env):
 
         if self.move_neutral:
             if ee_pos[2] <= 0.15 - 0.01:
+                print ('************* move_neutral True *************')
                 gripper = torch.tensor([-1], dtype=torch.float32, device=self.device)
                 goal_pos = torch.tensor(
                     [ee_pos[0], ee_pos[1], 0.15], device=self.device
@@ -1470,6 +1722,7 @@ class FurnitureSimEnv(gym.Env):
                 1,
             )  # Skill complete is always 1 when assembled.
         if not part1.pre_assemble_done:
+            print ('************* pre-assemble part1 *************')
             goal_pos, goal_ori, gripper, skill_complete = part1.pre_assemble(
                 ee_pos,
                 ee_quat,
@@ -1480,6 +1733,7 @@ class FurnitureSimEnv(gym.Env):
                 self.april_to_robot_mat,
             )
         elif not part2.pre_assemble_done:
+            print ('************* pre-assemble part2 *************')
             goal_pos, goal_ori, gripper, skill_complete = part2.pre_assemble(
                 ee_pos,
                 ee_quat,
@@ -1490,6 +1744,7 @@ class FurnitureSimEnv(gym.Env):
                 self.april_to_robot_mat,
             )
         else:
+            # print ('************* last step *************')
             goal_pos, goal_ori, gripper, skill_complete = self.furniture.parts[
                 part_idx2
             ].fsm_step(
@@ -1542,6 +1797,7 @@ class FurnitureSimEnv(gym.Env):
         return action.unsqueeze(0), skill_complete
 
     def assembly_success(self):
+        print ('************* assembly_success *************')
         return self._done().squeeze()
 
     def __del__(self):
