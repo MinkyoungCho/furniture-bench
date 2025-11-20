@@ -32,6 +32,126 @@ class RoundTableLeg(Leg):
         self.prev_pose = None
         self._state = "reach_leg_floor_xy"
         self.gripper_action = -1
+        self.pre_assemble_done = False
+
+    def pre_assemble(
+        self,
+        ee_pos,
+        ee_quat,
+        gripper_width,
+        rb_states,
+        part_idxs,
+        sim_to_april_mat,
+        april_to_robot,
+    ):
+        """Pre-assembly: grasp the leg and lift it up."""
+        def rot_mat_tensor(x, y, z, device):
+            return torch.tensor(rot_mat([x, y, z], hom=True), device=device).float()
+        
+        next_state = self._state
+        
+        ee_pose = C.to_homogeneous(ee_pos, C.quat2mat(ee_quat))
+        leg_pose = C.to_homogeneous(
+            rb_states[part_idxs[self.name]][0][:3],
+            C.quat2mat(rb_states[part_idxs[self.name]][0][3:7]),
+        )
+        
+        leg_pose = sim_to_april_mat @ leg_pose
+        device = ee_pose.device
+        
+        margin = rot_mat_tensor(0, -np.pi / 5, 0, device)
+        
+        if self._state == "reach_leg_floor_xy":
+            leg_pose = self._find_down_z(leg_pose).clone().to(device)
+            leg_pose = (
+                torch.tensor(get_mat([0, 0.043, 0], [0, 0, 0]), device=device)
+                @ leg_pose
+            )
+            rot = rot_mat_tensor(np.pi / 2, -np.pi / 2, 0, device)
+            pos = leg_pose[:4, 3]
+            target_pos = (april_to_robot @ pos)[:3]
+            target_ori = ee_pose[:3, :3]
+            target_pos[2] = ee_pos[2]
+            target = self.add_noise_first_target(
+                C.to_homogeneous(target_pos, target_ori),
+                ori_noise=torch.tensor([0, 0, 0, 1], device=device),
+            )
+            if self.satisfy(ee_pose, target, pos_error_threshold=0.02):
+                self.prev_pose = target.clone()
+                self.prev_pose[2, 3] -= 0.02
+                next_state = "reach_leg_ori"
+        elif self._state == "reach_leg_ori":
+            rot = rot_mat_tensor(np.pi / 2, -np.pi / 2, 0, device)
+            theta_y = torch.acos(leg_pose[1, 1]).detach().cpu().numpy()
+            sign = 1 if leg_pose[0, 1] > 0 else -1
+            target_ori = (
+                rot_mat_tensor(0, 0, sign * theta_y, device)
+                @ margin
+                @ april_to_robot
+                @ rot
+            )[:3, :3]
+            target_pos = (
+                april_to_robot
+                @ torch.tensor(get_mat([0, 0.043, 0], [0, 0, 0]), device=device)
+                @ leg_pose[:4, 3]
+            )[:3]
+            target_pos[2] = ee_pos[2]
+            target = C.to_homogeneous(target_pos, target_ori)
+            if self.satisfy(ee_pose, target, pos_error_threshold=0.015):
+                self.prev_pose = target
+                next_state = "reach_leg_floor_z"
+        elif self._state == "reach_leg_floor_z":
+            rot = rot_mat_tensor(np.pi / 2, -np.pi / 2, 0, device)
+            theta_y = torch.acos(leg_pose[1, 1]).detach().cpu().numpy()
+            sign = 1 if leg_pose[0, 1] > 0 else -1
+            target_ori = (
+                rot_mat_tensor(0, 0, sign * theta_y, device)
+                @ margin
+                @ april_to_robot
+                @ rot
+            )[:3, :3]
+            target_pos = (
+                april_to_robot
+                @ torch.tensor(get_mat([0, 0.043, 0], [0, 0, 0]), device=device)
+                @ leg_pose[:4, 3]
+            )[:3]
+            target_pos[2] += 0.01
+            target = C.to_homogeneous(target_pos, target_ori)
+            if self.satisfy(ee_pose, target, pos_error_threshold=0.007):
+                self.prev_pose = target
+                next_state = "pick_leg"
+        elif self._state == "pick_leg":
+            target = self.prev_pose
+            self.gripper_action = 1
+            if self.gripper_less(gripper_width, 2 * self.half_width + 0.001):
+                self.prev_pose = target
+                next_state = "lift_up"
+        elif self._state == "lift_up":
+            target_pos = self.prev_pose[:3, 3] + torch.tensor(
+                [0, 0, 0.13], device=device
+            )
+            target_ori = ee_pose[:3, :3]
+            target = self.add_noise_first_target(
+                C.to_homogeneous(target_pos, target_ori)
+            )
+            if self.satisfy(
+                ee_pose, target, pos_error_threshold=0.02, ori_error_threshold=0.3
+            ):
+                self.prev_pose = target
+                next_state = "done"
+        elif self._state == "done":
+            self.gripper_action = 1  # Keep holding
+            self.pre_assemble_done = True
+            target = self.prev_pose
+        
+        skill_complete = self.may_transit_state(next_state)
+        
+        return (
+            target[:3, 3],
+            C.mat2quat(target[:3, :3]),
+            torch.tensor([self.gripper_action], device=device),
+            skill_complete,
+        )
 
     def fsm_step(
         self,
@@ -68,6 +188,9 @@ class RoundTableLeg(Leg):
 
         margin = rot_mat_tensor(0, -np.pi / 5, 0, ee_pose.device)
         device = ee_pose.device
+        
+        # Initialize target with current pose
+        target = ee_pose
 
         def find_leg_pose_x_look_front(leg_pose):
             best_leg_pose = leg_pose.clone()
@@ -233,7 +356,7 @@ class RoundTableLeg(Leg):
 
             rel = rel_rot_mat(leg_pose_robot, target_hole_pose_robot)
             target = rel @ ee_pose
-            target[2] += 0.03  # Margin.
+            target[2] += 0.02636  #
             if self.satisfy(
                 ee_pose,
                 target,
@@ -287,6 +410,10 @@ class RoundTableLeg(Leg):
             if self.satisfy(ee_pose, target, ori_error_threshold=0.3):
                 self.prev_pose = target
                 next_state = "release"
+        else:
+            # Handle any unexpected states (like "done" from pre_assemble)
+            # Just maintain current position
+            target = self.prev_pose if self.prev_pose is not None else ee_pose
 
         skill_complete = self.may_transit_state(next_state)
 

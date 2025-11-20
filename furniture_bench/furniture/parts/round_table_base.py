@@ -44,7 +44,7 @@ class RoundTableBase(Part):
         self.grasp_margin_z = 0.006
         self.init_ee_pos = None
 
-        self.base_grip_width = 0.04
+        self.base_grip_width = 0.02
 
     def is_in_reset_ori(self, pose, from_skill, ori_bound):
         return pose[2, 2] < -ori_bound
@@ -81,28 +81,101 @@ class RoundTableBase(Part):
         if self.init_ee_pos is None:
             self.init_ee_pos = ee_pos.clone()
 
+        # Initialize target with current pose
+        target = ee_pose
+
         if self._state == "move_up":
             self.gripper_action = -1
             target_pos = self.init_ee_pos + torch.tensor([0, 0, 0.03], device=device)
             target_ori = ee_pose[:3, :3]
             target = C.to_homogeneous(target_pos, target_ori)
             if self.satisfy(
-                ee_pose, target, pos_error_threshold=0.00, ori_error_threshold=0.0
+                ee_pose, target, pos_error_threshold=0.01, ori_error_threshold=0.3
             ):
                 self.prev_pose = target
-                next_state = "move_center"
-        if self._state == "move_center":
-            z = ee_pose[2, 3]
-            target_pos = torch.tensor([self.prev_pose[0, 3], -0.05, z], device=device)
-            target_ori = self.prev_pose[:3, :3]
+                next_state = "reach_base_grasp_xy"
+        elif self._state == "reach_base_grasp_xy":
+            # Move to above the base
+            self.gripper_action = -1  # Keep gripper open
+            rot = torch.tensor(rot_mat([np.pi, 0, 0], hom=True), device=device).float()
+            theta_y = torch.acos(base_pose[1, 1]).detach().cpu().numpy()
+            if base_pose[0, 1] < 0:
+                theta = np.pi - theta_y + np.pi / 4
+            else:
+                theta = theta_y - 3 / 4 * np.pi
+            target_ori = (
+                torch.tensor(rot_mat([0, 0, theta], hom=True), device=device).float()
+                @ rot
+            )[:3, :3]
+            pos = base_pose[:4, 3]
+            target_pos = (april_to_robot @ pos)[:3]
+            target_pos[2] = ee_pos[2]  # Keep current z
+            target = C.to_homogeneous(target_pos, target_ori)
+            if self.satisfy(
+                ee_pose, target, pos_error_threshold=0.02, ori_error_threshold=0.3
+            ):
+                self.prev_pose = target.clone()
+                next_state = "reach_base_grasp_z"
+        elif self._state == "reach_base_grasp_z":
+            # Move down to grasp the base
+            self.gripper_action = -1  # Keep gripper open
+            rot = torch.tensor(rot_mat([np.pi, 0, 0], hom=True), device=device).float()
+            theta_y = torch.acos(base_pose[1, 1]).detach().cpu().numpy()
+            if base_pose[0, 1] < 0:
+                theta = np.pi - theta_y + np.pi / 4
+            else:
+                theta = theta_y - 3 / 4 * np.pi
+            target_ori = (
+                torch.tensor(rot_mat([0, 0, theta], hom=True), device=device).float()
+                @ rot
+            )[:3, :3]
+            pos = base_pose[:4, 3]
+            target_pos = (april_to_robot @ pos)[:3]
+            target_pos[2] += 0.010  # Margin
+            target = C.to_homogeneous(target_pos, target_ori)
+            if self.satisfy(
+                ee_pose, target, pos_error_threshold=0.01, ori_error_threshold=0.3
+            ):
+                self.prev_pose = target
+                next_state = "pick_base"
+        elif self._state == "pick_base":
+            # Close gripper to grasp base
+            target = self.prev_pose
+            self.gripper_action = 1  # Close gripper
+            if self.gripper_less(
+                gripper_width, self.base_grip_width + 0.001, cnt_max=20
+            ):
+                self.prev_pose = target
+                next_state = "lift_up_pre"
+        elif self._state == "lift_up_pre":
+            # Lift up the base
+            self.gripper_action = 1  # CRITICAL: Keep holding!
+            target_pos = self.prev_pose[:3, 3] + torch.tensor(
+                [0, 0, 0.15], device=device
+            )
+            target_ori = ee_pose[:3, :3]
             target = C.to_homogeneous(target_pos, target_ori)
             if self.satisfy(
                 ee_pose, target, pos_error_threshold=0.02, ori_error_threshold=0.3
             ):
                 self.prev_pose = target
-                next_state = "reach_base_floor_xy"
+                next_state = "move_to_safe"
+        elif self._state == "move_to_safe":
+            # Move to safe waiting position - far back and to the side
+            self.gripper_action = 1  # CRITICAL: Keep holding the base!
+            target_pos = torch.tensor([0.25, -0.25, 0.25], device=device)  # Further back and to the side
+            target_ori = self.prev_pose[:3, :3]
+            target = C.to_homogeneous(target_pos, target_ori)
+            if self.satisfy(
+                ee_pose, target, pos_error_threshold=0.03, ori_error_threshold=0.3
+            ):
+                self.prev_pose = target
+                next_state = "done"
                 self.pre_assemble_done = True
-                target = self.prev_pose
+        elif self._state == "done":
+            # Pre-assemble complete, maintain safe position
+            self.gripper_action = 1  # CRITICAL: Keep holding!
+            target = self.prev_pose if self.prev_pose is not None else ee_pose
 
         skill_complete = self.may_transit_state(next_state)
 
@@ -140,8 +213,23 @@ class RoundTableBase(Part):
         base_pose = sim_to_april_mat @ base_pose
 
         device = ee_pose.device
+        
+        # Initialize target with current pose
+        target = ee_pose
 
-        if self._state == "reach_base_floor_xy":
+        if self._state == "move_to_assembly":
+            # Move from safe position to above the leg for assembly
+            self.gripper_action = 1  # CRITICAL: Keep holding!
+            target_pos = torch.tensor([0.50, 0.0, 0.20], device=device)
+            target_ori = self.prev_pose[:3, :3] if self.prev_pose is not None else ee_pose[:3, :3]
+            target = C.to_homogeneous(target_pos, target_ori)
+            if self.satisfy(
+                ee_pose, target, pos_error_threshold=0.02, ori_error_threshold=0.3
+            ):
+                self.prev_pose = target
+                next_state = "reach_base_floor_xy"
+        elif self._state == "reach_base_floor_xy":
+            self.gripper_action = 1  # Keep holding!
             rot = torch.tensor(rot_mat([np.pi, 0, 0], hom=True), device=device).float()
             theta_y = torch.acos(base_pose[1, 1]).detach().cpu().numpy()
             if base_pose[0, 1] < 0:
@@ -166,6 +254,7 @@ class RoundTableBase(Part):
                 self.prev_pose = target.clone()
                 next_state = "reach_base_floor_z"
         elif self._state == "reach_base_floor_z":
+            self.gripper_action = 1  # Keep holding!
             rot = torch.tensor(rot_mat([np.pi, 0, 0], hom=True), device=device).float()
             theta_y = torch.acos(base_pose[1, 1]).detach().cpu().numpy()
             if base_pose[0, 1] < 0:
@@ -188,13 +277,14 @@ class RoundTableBase(Part):
                 next_state = "pick_base"
         elif self._state == "pick_base":
             target = self.prev_pose
-            self.gripper_action = 1
+            self.gripper_action = 1  # Close gripper
             if self.gripper_less(
                 gripper_width, self.base_grip_width + 0.001, cnt_max=20
             ):
                 self.prev_pose = target
                 next_state = "lift_up_base"
         elif self._state == "lift_up_base":
+            self.gripper_action = 1  # Keep holding!
             target_pos = self.prev_pose[:3, 3] + torch.tensor(
                 [0, 0, 0.19], device=device
             )
@@ -208,6 +298,7 @@ class RoundTableBase(Part):
                 self.prev_pose = target
                 next_state = "move_center"
         elif self._state == "move_center":
+            self.gripper_action = 1  # Keep holding!
             target_pos = torch.tensor(
                 [self.prev_pose[0, 3], 0.0, self.prev_pose[2, 3]], device=device
             )
@@ -221,6 +312,7 @@ class RoundTableBase(Part):
                 self.prev_pose = target
                 next_state = "reach_base_xy"
         elif self._state == "reach_base_xy":
+            self.gripper_action = 1  # Keep holding!
             base_screw_pose_robot = (
                 april_to_robot
                 @ leg_pose
@@ -243,6 +335,7 @@ class RoundTableBase(Part):
                 self.prev_pose = target
                 next_state = "reach_base_z"
         elif self._state == "reach_base_z":
+            self.gripper_action = 1  # Keep holding!
             base_screw_pose_robot = (
                 april_to_robot
                 @ leg_pose
@@ -261,10 +354,12 @@ class RoundTableBase(Part):
                 self.prev_pose = target
                 next_state = "insert_base"
         elif self._state == "insert_base":  # Transition for skill labeling.
+            self.gripper_action = 1  # Keep holding!
             target = self.prev_pose
             self.prev_pose = target
             next_state = "screw_gripper"
         elif self._state == "screw_gripper":
+            self.gripper_action = 1  # Keep holding!
             target_pos = self.prev_pose[:3, 3]
             target_ori = (
                 torch.tensor(rot_mat([np.pi, 0, -np.pi / 2])).to(device).float()
@@ -389,6 +484,10 @@ class RoundTableBase(Part):
             if self.satisfy(ee_pose, target):
                 self.prev_pose = target
                 next_state = "screw_gripper"
+        else:
+            # Handle any unexpected states
+            target = self.prev_pose if self.prev_pose is not None else ee_pose
+            
         skill_complete = self.may_transit_state(next_state)
 
         return (
@@ -397,3 +496,4 @@ class RoundTableBase(Part):
             torch.tensor([self.gripper_action], device=device),
             skill_complete,
         )
+

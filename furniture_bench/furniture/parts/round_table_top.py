@@ -115,23 +115,11 @@ class RoundTableTop(Part):
                 self.prev_pose = target
                 next_state = "push"
         if self._state == "push":
-            target_pos = torch.zeros((4,), device=device)
-            target_pos[-1] = 1
-            for name in ["obstacle_front", "obstacle_right", "obstacle_left"]:
-                obstacle_pos = torch.cat(
-                    [
-                        rb_states[part_idxs[name]][0][:3],
-                        torch.tensor([1.0], device=device),
-                    ]
-                )
-                target_pos[0] = max(obstacle_pos[0], target_pos[0])
-                target_pos[1] = max(obstacle_pos[1], target_pos[1])
-            target_pos = april_to_robot @ sim_to_april_mat @ target_pos
-            target_pos[0] -= self.radius
-            target_pos[1] -= self.radius
-            # Margin
-            target_pos[2] = ee_pose[2, 3]  # Keep z the same.
-            target_pos = target_pos[:3]
+            # For round_table with dual-arm, no obstacles - just move forward to assembly position
+            target_pos = self.prev_pose[:3, 3].clone()
+            # Move forward to a suitable assembly position
+            target_pos[0] += 0.15  # Move 15cm forward
+            target_pos[1] = 0.0    # Center position
             target_ori = self.prev_pose[:3, :3]
 
             target = self.add_noise_first_target(

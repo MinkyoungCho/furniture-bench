@@ -97,6 +97,14 @@ class FurnitureSimEnv(gym.Env):
         self.device = torch.device("cuda", compute_device_id)
 
         self.assemble_idx = 0
+        # Track if robot 1 has retreated to safe position for round_table
+        self.robot1_retreated = False
+        
+        # For round_table spatial assignment
+        self.round_table_arm_assignments = {}  # {env_idx: {'arm1': 'part_name', 'arm2': 'part_name'}}
+        self.round_table_fsm_stage = 0  # 0: not started, 1: parallel grasp, 2: leg assembly, 3: base assembly
+        self.round_table_stage1_complete = {'arm1': False, 'arm2': False}  # Track stage 1 completion
+        
         # Furniture for each environment (reward, reset).
         self.furnitures = [furniture_factory(furniture) for _ in range(num_envs)]
 
@@ -225,6 +233,11 @@ class FurnitureSimEnv(gym.Env):
             [0, 0, 0],
         )
         self.base_tag_from_robot_mat = config["robot"]["tag_base_from_robot_base"]
+        
+        # Compute base_tag transformation for robot 2
+        # base_tag is at the same world position, but we need transformation relative to robot 2
+        base_tag_world = self.franka_from_origin_mat @ self.base_tag_from_robot_mat
+        self.base_tag_from_robot2_mat = np.linalg.inv(self.franka2_from_origin_mat) @ base_tag_world
 
         franka_link_dict = self.isaac_gym.get_asset_rigid_body_dict(self.franka_asset)
         self.franka_ee_index = franka_link_dict["k_ee_link"]
@@ -725,6 +738,13 @@ class FurnitureSimEnv(gym.Env):
     @property
     def april_to_robot_mat(self):
         return torch.tensor(self.base_tag_from_robot_mat, device=self.device)
+    
+    @property
+    def april_to_robot2_mat(self):
+        """Transformation from AprilTag to robot 2 base coordinate."""
+        # Compute transformation from AprilTag to robot 2 base
+        # base_tag is positioned relative to robot 1, we need to compute it relative to robot 2
+        return torch.tensor(self.base_tag_from_robot2_mat, device=self.device)
 
     @property
     def robot_to_ee_mat(self):
@@ -831,76 +851,179 @@ class FurnitureSimEnv(gym.Env):
             else:
                 action_quat = C.axisangle2quat(action[env_idx][3:6])
 
-            # First robot
-            self.osc_ctrls[env_idx].set_goal(
-                action[env_idx][:3] + ee_pos[env_idx],
-                C.quat_multiply(ee_quat[env_idx], action_quat).to(self.device),
-            )
-            # Second robot - move to obstacle position first, then grasp lamp base when it arrives
             furniture = self.furnitures[env_idx] if hasattr(self, 'furnitures') else self.furniture
-            lamp_base_part = None
-            for part in furniture.parts:
-                if part.name == "lamp_base":
-                    lamp_base_part = part
-                    break
             
-            # Calculate obstacle target position from base_tag position
-            base_tag_pos = self.base_tag_positions[env_idx]
-            obstacle_target_world = torch.tensor([
-                base_tag_pos.x + 0.37 + 0.01,
-                0.0,
-                self.table_surface_z + 0.015
-            ], device=self.device)
-            
-            # Get franka2's base position in world coordinates
-            franka2_base_world = self.rb_states[self.base2_idxs[env_idx], :3]
-            
-            # Set orientation: gripper parallel to ground (horizontal)
-            gripper_ori_ground = torch.tensor([0.707, 0, 0, 0.707], device=self.device)  # Quaternion for 90 deg rotation around x-axis
-            
-            if lamp_base_part is not None:
-                # Check if lamp_base is in push state (franka is pushing base forward)
-                if lamp_base_part._state in ["push", "push_x"]:
-                    # When franka is pushing, franka2 should be at obstacle position ready to grasp
-                    obstacle_target_rel = obstacle_target_world - franka2_base_world
-                    self.osc2_ctrls[env_idx].set_goal(
-                        obstacle_target_rel,
-                        gripper_ori_ground,
+            # Determine control strategy based on furniture type
+            if self.furniture_name == "round_table":
+                # New spatial assignment logic with 3 stages
+                # Stage 1: Parallel grasp
+                # Stage 2: Leg assembly + retreat
+                # Stage 3: Base assembly
+                
+                if self.round_table_fsm_stage == 1:
+                    # Stage 1: Both robots grasp in parallel
+                    # Robot 1 executes action from get_assembly_action
+                    self.osc_ctrls[env_idx].set_goal(
+                        action[env_idx][:3] + ee_pos[env_idx],
+                        C.quat_multiply(ee_quat[env_idx], action_quat).to(self.device),
                     )
-                elif lamp_base_part._state == "release":
-                    # When base is released, franka2 should grasp it
-                    # Get lamp_base position in world coordinates
-                    if "lamp_base" in self.part_idxs and len(self.part_idxs["lamp_base"]) > env_idx:
-                        lamp_base_idx = self.part_idxs["lamp_base"][env_idx]
-                        lamp_base_pos = self.rb_states[lamp_base_idx, :3]
-                        # Position franka2's gripper to grasp the base (slightly above and in front)
-                        grasp_target = lamp_base_pos.clone()
-                        grasp_target[2] += 0.02  # Slightly above
-                        grasp_target_rel = grasp_target - franka2_base_world
+                    
+                    # Robot 2 executes stored action
+                    if hasattr(self, 'round_table_arm2_action'):
+                        if self.act_rot_repr == "quat":
+                            action2_quat = self.round_table_arm2_action[3:7]
+                        elif self.act_rot_repr == "rot_6d":
+                            import pytorch3d.transforms as pt
+                            rot_6d = self.round_table_arm2_action[3:9]
+                            rot_mat = pt.rotation_6d_to_matrix(rot_6d.unsqueeze(0))
+                            quat = pt.matrix_to_quaternion(rot_mat)
+                            action2_quat = quat[0]
+                        else:
+                            action2_quat = C.axisangle2quat(self.round_table_arm2_action[3:6])
+                        
                         self.osc2_ctrls[env_idx].set_goal(
-                            grasp_target_rel,
+                            self.round_table_arm2_action[:3] + ee2_pos[env_idx],
+                            C.quat_multiply(ee2_quat[env_idx], action2_quat).to(self.device),
+                        )
+                
+                elif self.round_table_fsm_stage == 2:
+                    # Stage 2: Leg assembly (one arm active) or retreat
+                    if self.leg_holding_arm == 1:
+                        # Robot 1 is active
+                        self.osc_ctrls[env_idx].set_goal(
+                            action[env_idx][:3] + ee_pos[env_idx],
+                            C.quat_multiply(ee_quat[env_idx], action_quat).to(self.device),
+                        )
+                        # Robot 2 stays at current position
+                        self.osc2_ctrls[env_idx].set_goal(
+                            ee2_pos[env_idx],
+                            ee2_quat[env_idx],
+                        )
+                    else:  # leg_holding_arm == 2
+                        # Robot 2 is active
+                        self.osc2_ctrls[env_idx].set_goal(
+                            action[env_idx][:3] + ee2_pos[env_idx],
+                            C.quat_multiply(ee2_quat[env_idx], action_quat).to(self.device),
+                        )
+                        # Robot 1 stays at current position
+                        self.osc_ctrls[env_idx].set_goal(
+                            ee_pos[env_idx],
+                            ee_quat[env_idx],
+                        )
+                
+                elif self.round_table_fsm_stage == 3:
+                    # Stage 3: Base assembly
+                    base_holding_arm = 2 if self.leg_holding_arm == 1 else 1
+                    
+                    if base_holding_arm == 1:
+                        # Robot 1 is active
+                        self.osc_ctrls[env_idx].set_goal(
+                            action[env_idx][:3] + ee_pos[env_idx],
+                            C.quat_multiply(ee_quat[env_idx], action_quat).to(self.device),
+                        )
+                        # Robot 2 maintains safe position
+                        if self.leg_holding_arm == 2:
+                            safe_pos = torch.tensor([0.3, 0.2, 0.25], device=self.device)
+                            safe_quat = torch.tensor([0, 0.707, 0, 0.707], device=self.device)
+                            self.osc2_ctrls[env_idx].set_goal(
+                                safe_pos,
+                                safe_quat,
+                            )
+                    else:  # base_holding_arm == 2
+                        # Robot 2 is active
+                        self.osc2_ctrls[env_idx].set_goal(
+                            action[env_idx][:3] + ee2_pos[env_idx],
+                            C.quat_multiply(ee2_quat[env_idx], action_quat).to(self.device),
+                        )
+                        # Robot 1 maintains safe position
+                        if self.leg_holding_arm == 1:
+                            safe_pos = torch.tensor([0.3, -0.2, 0.25], device=self.device)
+                            safe_quat = torch.tensor([0, 0.707, 0, 0.707], device=self.device)
+                            self.osc_ctrls[env_idx].set_goal(
+                                safe_pos,
+                                safe_quat,
+                            )
+            elif self.furniture_name == "lamp":
+                # For lamp: original logic with robot 1 active and robot 2 as obstacle/holder
+                self.osc_ctrls[env_idx].set_goal(
+                    action[env_idx][:3] + ee_pos[env_idx],
+                    C.quat_multiply(ee_quat[env_idx], action_quat).to(self.device),
+                )
+                # Second robot - move to obstacle position first, then grasp lamp base when it arrives
+                lamp_base_part = None
+                for part in furniture.parts:
+                    if part.name == "lamp_base":
+                        lamp_base_part = part
+                        break
+                
+                # Calculate obstacle target position from base_tag position
+                base_tag_pos = self.base_tag_positions[env_idx]
+                obstacle_target_world = torch.tensor([
+                    base_tag_pos.x + 0.37 + 0.01,
+                    0.0,
+                    self.table_surface_z + 0.015
+                ], device=self.device)
+                
+                # Get franka2's base position in world coordinates
+                franka2_base_world = self.rb_states[self.base2_idxs[env_idx], :3]
+                
+                # Set orientation: gripper parallel to ground (horizontal)
+                gripper_ori_ground = torch.tensor([0.707, 0, 0, 0.707], device=self.device)  # Quaternion for 90 deg rotation around x-axis
+                
+                if lamp_base_part is not None:
+                    # Check if lamp_base is in push state (franka is pushing base forward)
+                    if lamp_base_part._state in ["push", "push_x"]:
+                        # When franka is pushing, franka2 should be at obstacle position ready to grasp
+                        obstacle_target_rel = obstacle_target_world - franka2_base_world
+                        self.osc2_ctrls[env_idx].set_goal(
+                            obstacle_target_rel,
                             gripper_ori_ground,
                         )
+                    elif lamp_base_part._state == "release":
+                        # When base is released, franka2 should grasp it
+                        # Get lamp_base position in world coordinates
+                        if "lamp_base" in self.part_idxs and len(self.part_idxs["lamp_base"]) > env_idx:
+                            lamp_base_idx = self.part_idxs["lamp_base"][env_idx]
+                            lamp_base_pos = self.rb_states[lamp_base_idx, :3]
+                            # Position franka2's gripper to grasp the base (slightly above and in front)
+                            grasp_target = lamp_base_pos.clone()
+                            grasp_target[2] += 0.02  # Slightly above
+                            grasp_target_rel = grasp_target - franka2_base_world
+                            self.osc2_ctrls[env_idx].set_goal(
+                                grasp_target_rel,
+                                gripper_ori_ground,
+                            )
+                        else:
+                            # Fallback: move to obstacle position
+                            obstacle_target_rel = obstacle_target_world - franka2_base_world
+                            self.osc2_ctrls[env_idx].set_goal(
+                                obstacle_target_rel,
+                                gripper_ori_ground,
+                            )
                     else:
-                        # Fallback: move to obstacle position
+                        # Before push state: move franka2 to obstacle position (serving as obstacle)
                         obstacle_target_rel = obstacle_target_world - franka2_base_world
                         self.osc2_ctrls[env_idx].set_goal(
                             obstacle_target_rel,
                             gripper_ori_ground,
                         )
                 else:
-                    # Before push state: move franka2 to obstacle position (serving as obstacle)
+                    # No lamp_base part found, move to obstacle position
                     obstacle_target_rel = obstacle_target_world - franka2_base_world
                     self.osc2_ctrls[env_idx].set_goal(
                         obstacle_target_rel,
                         gripper_ori_ground,
                     )
             else:
-                # No lamp_base part found, move to obstacle position
-                obstacle_target_rel = obstacle_target_world - franka2_base_world
+                # For other furniture types: only use robot 1
+                self.osc_ctrls[env_idx].set_goal(
+                    action[env_idx][:3] + ee_pos[env_idx],
+                    C.quat_multiply(ee_quat[env_idx], action_quat).to(self.device),
+                )
+                # Keep robot 2 at neutral
                 self.osc2_ctrls[env_idx].set_goal(
-                    obstacle_target_rel,
-                    gripper_ori_ground,
+                    ee2_pos[env_idx],
+                    ee2_quat[env_idx],
                 )
 
         for _ in range(sim_steps):
@@ -911,37 +1034,166 @@ class FurnitureSimEnv(gym.Env):
             grip_action = torch.zeros((self.num_envs, 2))  # Two grippers
             for env_idx in range(self.num_envs):
                 grasp = action[env_idx, -1]
-                
-                # First robot gripper
-                if (
-                    torch.sign(grasp) != torch.sign(self.last_grasp[env_idx])
-                    and torch.abs(grasp) > self.grasp_margin
-                ):
-                    grip_sep = self.max_gripper_width if grasp < 0 else 0.0
-                    self.last_grasp[env_idx] = grasp
-                else:
-                    if self.last_grasp[env_idx] < 0:
-                        grip_sep = self.max_gripper_width
-                    else:
-                        grip_sep = 0.0
-                grip_action[env_idx, 0] = grip_sep
-                
-                # Second robot gripper - close when grasping lamp base
                 furniture = self.furnitures[env_idx] if hasattr(self, 'furnitures') else self.furniture
-                lamp_base_part = None
-                for part in furniture.parts:
-                    if part.name == "lamp_base":
-                        lamp_base_part = part
-                        break
                 
-                # Close gripper when in release state (base is being released by franka)
-                if lamp_base_part is not None and lamp_base_part._state == "release":
-                    # Close gripper to grasp
-                    grip_action[env_idx, 1] = 0.0  # Closed
+                if self.furniture_name == "round_table":
+                    # New spatial assignment logic with 3 stages
+                    if self.round_table_fsm_stage == 1:
+                        # Stage 1: Both robots control their grippers (parallel grasp)
+                        # Robot 1
+                        if (
+                            torch.sign(grasp) != torch.sign(self.last_grasp[env_idx])
+                            and torch.abs(grasp) > self.grasp_margin
+                        ):
+                            grip_sep1 = self.max_gripper_width if grasp < 0 else 0.0
+                            self.last_grasp[env_idx] = grasp
+                        else:
+                            if self.last_grasp[env_idx] < 0:
+                                grip_sep1 = self.max_gripper_width
+                            else:
+                                grip_sep1 = 0.0
+                        grip_action[env_idx, 0] = grip_sep1
+                        
+                        # Robot 2 - use stored action
+                        if hasattr(self, 'round_table_arm2_action'):
+                            grasp2 = self.round_table_arm2_action[-1]
+                            if (
+                                torch.sign(grasp2) != torch.sign(self.last_grasp2[env_idx])
+                                and torch.abs(grasp2) > self.grasp_margin
+                            ):
+                                grip_sep2 = self.max_gripper_width if grasp2 < 0 else 0.0
+                                self.last_grasp2[env_idx] = grasp2
+                            else:
+                                if self.last_grasp2[env_idx] < 0:
+                                    grip_sep2 = self.max_gripper_width
+                                else:
+                                    grip_sep2 = 0.0
+                            grip_action[env_idx, 1] = grip_sep2
+                        else:
+                            grip_action[env_idx, 1] = self.max_gripper_width
+                    
+                    elif self.round_table_fsm_stage == 2:
+                        # Stage 2: Only leg-holding arm is active
+                        if self.leg_holding_arm == 1:
+                            # Robot 1 is active (assembling leg)
+                            if (
+                                torch.sign(grasp) != torch.sign(self.last_grasp[env_idx])
+                                and torch.abs(grasp) > self.grasp_margin
+                            ):
+                                grip_sep = self.max_gripper_width if grasp < 0 else 0.0
+                                self.last_grasp[env_idx] = grasp
+                            else:
+                                if self.last_grasp[env_idx] < 0:
+                                    grip_sep = self.max_gripper_width
+                                else:
+                                    grip_sep = 0.0
+                            grip_action[env_idx, 0] = grip_sep
+                            # Robot 2 holds base - MUST keep gripper CLOSED
+                            grip_action[env_idx, 1] = 0.0  # Closed to hold base
+                        else:  # leg_holding_arm == 2
+                            # Robot 2 is active (assembling leg)
+                            if (
+                                torch.sign(grasp) != torch.sign(self.last_grasp2[env_idx])
+                                and torch.abs(grasp) > self.grasp_margin
+                            ):
+                                grip_sep = self.max_gripper_width if grasp < 0 else 0.0
+                                self.last_grasp2[env_idx] = grasp
+                            else:
+                                if self.last_grasp2[env_idx] < 0:
+                                    grip_sep = self.max_gripper_width
+                                else:
+                                    grip_sep = 0.0
+                            grip_action[env_idx, 1] = grip_sep
+                            # Robot 1 holds base - MUST keep gripper CLOSED
+                            grip_action[env_idx, 0] = 0.0  # Closed to hold base
+                    
+                    elif self.round_table_fsm_stage == 3:
+                        # Stage 3: Only base-holding arm is active
+                        base_holding_arm = 2 if self.leg_holding_arm == 1 else 1
+                        
+                        if base_holding_arm == 1:
+                            # Robot 1 is active
+                            if (
+                                torch.sign(grasp) != torch.sign(self.last_grasp[env_idx])
+                                and torch.abs(grasp) > self.grasp_margin
+                            ):
+                                grip_sep = self.max_gripper_width if grasp < 0 else 0.0
+                                self.last_grasp[env_idx] = grasp
+                            else:
+                                if self.last_grasp[env_idx] < 0:
+                                    grip_sep = self.max_gripper_width
+                                else:
+                                    grip_sep = 0.0
+                            grip_action[env_idx, 0] = grip_sep
+                            # Robot 2 gripper open (in retreat)
+                            grip_action[env_idx, 1] = self.max_gripper_width
+                        else:  # base_holding_arm == 2
+                            # Robot 2 is active
+                            if (
+                                torch.sign(grasp) != torch.sign(self.last_grasp2[env_idx])
+                                and torch.abs(grasp) > self.grasp_margin
+                            ):
+                                grip_sep = self.max_gripper_width if grasp < 0 else 0.0
+                                self.last_grasp2[env_idx] = grasp
+                            else:
+                                if self.last_grasp2[env_idx] < 0:
+                                    grip_sep = self.max_gripper_width
+                                else:
+                                    grip_sep = 0.0
+                            grip_action[env_idx, 1] = grip_sep
+                            # Robot 1 gripper open (in retreat)
+                            grip_action[env_idx, 0] = self.max_gripper_width
+                    else:
+                        # Default: both grippers open
+                        grip_action[env_idx, 0] = self.max_gripper_width
+                        grip_action[env_idx, 1] = self.max_gripper_width
+                elif self.furniture_name == "lamp":
+                    # For lamp: original logic
+                    # First robot gripper
+                    if (
+                        torch.sign(grasp) != torch.sign(self.last_grasp[env_idx])
+                        and torch.abs(grasp) > self.grasp_margin
+                    ):
+                        grip_sep = self.max_gripper_width if grasp < 0 else 0.0
+                        self.last_grasp[env_idx] = grasp
+                    else:
+                        if self.last_grasp[env_idx] < 0:
+                            grip_sep = self.max_gripper_width
+                        else:
+                            grip_sep = 0.0
+                    grip_action[env_idx, 0] = grip_sep
+                    
+                    # Second robot gripper - close when grasping lamp base
+                    lamp_base_part = None
+                    for part in furniture.parts:
+                        if part.name == "lamp_base":
+                            lamp_base_part = part
+                            break
+                    
+                    # Close gripper when in release state (base is being released by franka)
+                    if lamp_base_part is not None and lamp_base_part._state == "release":
+                        # Close gripper to grasp
+                        grip_action[env_idx, 1] = 0.0  # Closed
+                    else:
+                        # Keep gripper open or maintain current state
+                        current_gripper2 = self.dof_pos[env_idx, 16:17] + self.dof_pos[env_idx, 17:18]
+                        grip_action[env_idx, 1] = current_gripper2
                 else:
-                    # Keep gripper open or maintain current state
-                    current_gripper2 = self.dof_pos[env_idx, 16:17] + self.dof_pos[env_idx, 17:18]
-                    grip_action[env_idx, 1] = current_gripper2
+                    # For other furniture: only control robot 1
+                    if (
+                        torch.sign(grasp) != torch.sign(self.last_grasp[env_idx])
+                        and torch.abs(grasp) > self.grasp_margin
+                    ):
+                        grip_sep = self.max_gripper_width if grasp < 0 else 0.0
+                        self.last_grasp[env_idx] = grasp
+                    else:
+                        if self.last_grasp[env_idx] < 0:
+                            grip_sep = self.max_gripper_width
+                        else:
+                            grip_sep = 0.0
+                    grip_action[env_idx, 0] = grip_sep
+                    # Robot 2 stays open
+                    grip_action[env_idx, 1] = self.max_gripper_width
 
                 # First robot control
                 state_dict = {}
@@ -984,14 +1236,19 @@ class FurnitureSimEnv(gym.Env):
                 # Gripper actions
                 if self.gripper_pos_control:
                     pos_action[env_idx, 7:9] = grip_action[env_idx, 0]
-                    pos_action[env_idx, 16:18] = grip_action[env_idx, 1]  # franka2 gripper stays at current position
+                    pos_action[env_idx, 16:18] = grip_action[env_idx, 1]
                 else:
-                    if grip_sep > 0:
+                    # Robot 1 gripper torque
+                    if grip_action[env_idx, 0] > 0:
                         torque_action[env_idx, 7:9] = sim_config["robot"]["gripper_torque"]
                     else:
                         torque_action[env_idx, 7:9] = -sim_config["robot"]["gripper_torque"]
-                    # franka2 gripper - apply zero torque to keep it stationary
-                    torque_action[env_idx, 16:18] = 0.0
+                    
+                    # Robot 2 gripper torque
+                    if grip_action[env_idx, 1] > 0:
+                        torque_action[env_idx, 16:18] = sim_config["robot"]["gripper_torque"]
+                    else:
+                        torque_action[env_idx, 16:18] = -sim_config["robot"]["gripper_torque"]
             
             # Apply actions
             if self.gripper_pos_control:
@@ -1392,6 +1649,14 @@ class FurnitureSimEnv(gym.Env):
 
         self.refresh()
         self.assemble_idx = 0
+        self.robot1_retreated = False  # Reset retreat flag
+        
+        # Reset round_table specific variables
+        self.round_table_fsm_stage = 0
+        self.round_table_arm_assignments = {}
+        self.round_table_stage1_complete = {'arm1': False, 'arm2': False}
+        if hasattr(self, 'round_table_arm2_action'):
+            delattr(self, 'round_table_arm2_action')
 
         if self.save_camera_input:
             self._save_camera_input()
@@ -1436,6 +1701,15 @@ class FurnitureSimEnv(gym.Env):
             self._reset_parts(env_idx)
         self.env_steps[env_idx] = 0
         self.move_neutral = False
+        self.robot1_retreated = False  # Reset retreat flag
+        
+        # Reset round_table specific variables
+        self.round_table_fsm_stage = 0
+        if env_idx in self.round_table_arm_assignments:
+            del self.round_table_arm_assignments[env_idx]
+        self.round_table_stage1_complete = {'arm1': False, 'arm2': False}
+        if hasattr(self, 'round_table_arm2_action'):
+            delattr(self, 'round_table_arm2_action')
 
     def reset_env_to(self, env_idx, state):
         """Reset to a specific state. **MUST refresh in between multiple calls
@@ -1665,6 +1939,267 @@ class FurnitureSimEnv(gym.Env):
             self.sim, ASSET_ROOT, self.franka_asset_file, asset_options
         )
 
+    def _assign_round_table_parts_by_proximity(self, env_idx=0):
+        """Assign RoundTableLeg and RoundTableBase to arms based on spatial proximity.
+        
+        Returns:
+            dict: {'arm1': 'part_name', 'arm2': 'part_name'}
+        """
+        # Get arm positions
+        ee1_pos, _ = self.get_ee_pose()
+        ee2_pos, _ = self.get_ee2_pose()
+        ee1_pos = ee1_pos[env_idx]
+        ee2_pos = ee2_pos[env_idx]
+        
+        # Get part positions
+        leg_idx = self.part_idxs['round_table_leg'][env_idx]
+        base_idx = self.part_idxs['round_table_base'][env_idx]
+        
+        leg_pos = self.rb_states[leg_idx, :3]
+        base_pos = self.rb_states[base_idx, :3]
+        
+        # Calculate distances
+        arm1_to_leg = torch.norm(ee1_pos - leg_pos)
+        arm1_to_base = torch.norm(ee1_pos - base_pos)
+        arm2_to_leg = torch.norm(ee2_pos - leg_pos)
+        arm2_to_base = torch.norm(ee2_pos - base_pos)
+        
+        # Assign based on closest distance
+        # We need to ensure each part is assigned to exactly one arm
+        if arm1_to_leg + arm2_to_base < arm1_to_base + arm2_to_leg:
+            # Arm 1 takes leg, Arm 2 takes base
+            assignment = {'arm1': 'round_table_leg', 'arm2': 'round_table_base'}
+        else:
+            # Arm 1 takes base, Arm 2 takes leg
+            assignment = {'arm1': 'round_table_base', 'arm2': 'round_table_leg'}
+        
+        print(f"************* Part Assignment *************")
+        print(f"Arm 1: {assignment['arm1']}")
+        print(f"Arm 2: {assignment['arm2']}")
+        print(f"Distances - Arm1->Leg: {arm1_to_leg:.3f}, Arm1->Base: {arm1_to_base:.3f}")
+        print(f"            Arm2->Leg: {arm2_to_leg:.3f}, Arm2->Base: {arm2_to_base:.3f}")
+        
+        return assignment
+    
+    def _get_round_table_assembly_action(self):
+        """Get assembly action for round_table with spatial assignment logic."""
+        env_idx = 0  # Only support one environment for now
+        
+        # Stage 0: Initialize and assign parts based on proximity
+        if self.round_table_fsm_stage == 0:
+            self.round_table_arm_assignments[env_idx] = self._assign_round_table_parts_by_proximity(env_idx)
+            self.round_table_fsm_stage = 1
+            print("************* Stage 0->1: Parts assigned, starting parallel grasp *************")
+        
+        # Stage 1: Parallel grasp - both arms pick up their assigned parts
+        if self.round_table_fsm_stage == 1:
+            # Get both arms' poses
+            ee1_pos, ee1_quat = self.get_ee_pose()
+            ee2_pos, ee2_quat = self.get_ee2_pose()
+            gripper1_width = self.gripper_width()
+            gripper2_width = self.dof_pos[:, 16:17] + self.dof_pos[:, 17:18]
+            
+            ee1_pos, ee1_quat = ee1_pos.squeeze(), ee1_quat.squeeze()
+            ee2_pos, ee2_quat = ee2_pos.squeeze(), ee2_quat.squeeze()
+            
+            # Get the parts assigned to each arm
+            arm1_part_name = self.round_table_arm_assignments[env_idx]['arm1']
+            arm2_part_name = self.round_table_arm_assignments[env_idx]['arm2']
+            
+            # Get the part objects
+            arm1_part = None
+            arm2_part = None
+            for part in self.furniture.parts:
+                if part.name == arm1_part_name:
+                    arm1_part = part
+                elif part.name == arm2_part_name:
+                    arm2_part = part
+            
+            # Check if both arms have completed grasping
+            arm1_done = arm1_part.pre_assemble_done if arm1_part else False
+            arm2_done = arm2_part.pre_assemble_done if arm2_part else False
+            
+            if arm1_done and arm2_done:
+                # Stage 1 complete, move to stage 2
+                self.round_table_fsm_stage = 2
+                print("************* Stage 1->2: Parallel grasp complete, starting leg assembly *************")
+                # Determine which arm holds the leg for stage 2
+                self.leg_holding_arm = 1 if arm1_part_name == 'round_table_leg' else 2
+                
+                # Reset leg part state for assembly phase (skip grasp states)
+                leg_part = None
+                for part in self.furniture.parts:
+                    if part.name == 'round_table_leg':
+                        leg_part = part
+                        break
+                if leg_part:
+                    # Reset to assembly starting state (after grasp)
+                    leg_part._state = "move_center"
+                    # Keep prev_pose - it's needed for move_center state
+                
+                return self._get_round_table_assembly_action()  # Recursively call for stage 2
+            
+            # Generate actions for both arms
+            goal_pos1, goal_ori1, gripper1, skill_complete1 = arm1_part.pre_assemble(
+                ee1_pos, ee1_quat, gripper1_width,
+                self.rb_states, self.part_idxs,
+                self.sim_to_april_mat, self.april_to_robot_mat
+            )
+            
+            goal_pos2, goal_ori2, gripper2, skill_complete2 = arm2_part.pre_assemble(
+                ee2_pos, ee2_quat, gripper2_width,
+                self.rb_states, self.part_idxs,
+                self.sim_to_april_mat, self.april_to_robot2_mat
+            )
+            
+            # Store arm2 action for step() to use
+            delta_pos2 = goal_pos2 - ee2_pos
+            delta_quat2 = C.quat_mul(C.quat_conjugate(ee2_quat), goal_ori2)
+            self.round_table_arm2_action = torch.concat([delta_pos2, delta_quat2, gripper2])
+            
+            # Return arm1 action
+            delta_pos1 = goal_pos1 - ee1_pos
+            delta_quat1 = C.quat_mul(C.quat_conjugate(ee1_quat), goal_ori1)
+            action1 = torch.concat([delta_pos1, delta_quat1, gripper1])
+            
+            return action1.unsqueeze(0), max(skill_complete1, skill_complete2)
+        
+        # Stage 2: Arm holding leg assembles it to top, then retreats
+        if self.round_table_fsm_stage == 2:
+            if self.leg_holding_arm == 1:
+                ee_pos, ee_quat = self.get_ee_pose()
+                gripper_width = self.gripper_width()
+                april_to_robot = self.april_to_robot_mat
+            else:
+                ee_pos, ee_quat = self.get_ee2_pose()
+                gripper_width = self.dof_pos[:, 16:17] + self.dof_pos[:, 17:18]
+                april_to_robot = self.april_to_robot2_mat
+            
+            ee_pos, ee_quat = ee_pos.squeeze(), ee_quat.squeeze()
+            
+            # Get leg part
+            leg_part = None
+            for part in self.furniture.parts:
+                if part.name == 'round_table_leg':
+                    leg_part = part
+            
+            # Check if assembly is complete
+            leg_pose = C.to_homogeneous(
+                self.rb_states[self.part_idxs['round_table_leg']][0][:3],
+                C.quat2mat(self.rb_states[self.part_idxs['round_table_leg']][0][3:7]),
+            )
+            top_pose = C.to_homogeneous(
+                self.rb_states[self.part_idxs['round_table_top']][0][:3],
+                C.quat2mat(self.rb_states[self.part_idxs['round_table_top']][0][3:7]),
+            )
+            rel_pose = torch.linalg.inv(top_pose) @ leg_pose
+            assembled_rel_poses = self.furniture.assembled_rel_poses[(0, 1)]
+            
+            # Debug: print assembly progress every 50 steps
+            if self.env_steps[0] % 50 == 0:
+                pos_error = torch.norm(rel_pose[:3, 3] - torch.tensor(assembled_rel_poses[0][:3, 3], device=self.device))
+                print(f"[Stage 2 Debug] Leg assembly progress - Position error: {pos_error:.4f}m, Current state: {leg_part._state}")
+            
+            if self.furniture.assembled(rel_pose.cpu().numpy(), assembled_rel_poses):
+                if not self.robot1_retreated:
+                    # Start retreat for leg-holding arm
+                    print("************* Stage 2: Leg assembled, starting retreat *************")
+                    # Generate retreat action
+                    if self.leg_holding_arm == 1:
+                        safe_pos = torch.tensor([0.3, -0.2, 0.25], device=self.device)
+                    else:
+                        safe_pos = torch.tensor([0.3, 0.2, 0.25], device=self.device)
+                    
+                    safe_quat = torch.tensor([0, 0.707, 0, 0.707], device=self.device)
+                    
+                    if torch.norm(ee_pos - safe_pos) < 0.03:
+                        self.robot1_retreated = True
+                        self.round_table_fsm_stage = 3
+                        print("************* Stage 2->3: Retreat complete, starting base assembly *************")
+                        return self._get_round_table_assembly_action()
+                    
+                    delta_pos = safe_pos - ee_pos
+                    delta_quat = C.quat_mul(C.quat_conjugate(ee_quat), safe_quat)
+                    gripper = torch.tensor([-1], dtype=torch.float32, device=self.device)
+                    action = torch.concat([delta_pos, delta_quat, gripper])
+                    return action.unsqueeze(0), 0
+            
+            # Assemble leg to top
+            goal_pos, goal_ori, gripper, skill_complete = leg_part.fsm_step(
+                ee_pos, ee_quat, gripper_width,
+                self.rb_states, self.part_idxs,
+                self.sim_to_april_mat, april_to_robot,
+                'round_table_top'
+            )
+            
+            delta_pos = goal_pos - ee_pos
+            delta_quat = C.quat_mul(C.quat_conjugate(ee_quat), goal_ori)
+            action = torch.concat([delta_pos, delta_quat, gripper])
+            
+            return action.unsqueeze(0), skill_complete
+        
+        # Stage 3: Arm holding base assembles it to leg
+        if self.round_table_fsm_stage == 3:
+            base_holding_arm = 2 if self.leg_holding_arm == 1 else 1
+            
+            if base_holding_arm == 1:
+                ee_pos, ee_quat = self.get_ee_pose()
+                gripper_width = self.gripper_width()
+                april_to_robot = self.april_to_robot_mat
+            else:
+                ee_pos, ee_quat = self.get_ee2_pose()
+                gripper_width = self.dof_pos[:, 16:17] + self.dof_pos[:, 17:18]
+                april_to_robot = self.april_to_robot2_mat
+            
+            ee_pos, ee_quat = ee_pos.squeeze(), ee_quat.squeeze()
+            
+            # Get base part and reset its state for assembly
+            base_part = None
+            first_call_stage3 = False
+            for part in self.furniture.parts:
+                if part.name == 'round_table_base':
+                    base_part = part
+                    # Reset to assembly starting state if coming from pre_assemble
+                    if base_part._state == "done":
+                        # Base is at safe position, need to move to assembly position
+                        base_part._state = "move_to_assembly"
+                        first_call_stage3 = True
+                        # Keep prev_pose (safe position)
+            
+            # Check if assembly is complete
+            leg_pose = C.to_homogeneous(
+                self.rb_states[self.part_idxs['round_table_leg']][0][:3],
+                C.quat2mat(self.rb_states[self.part_idxs['round_table_leg']][0][3:7]),
+            )
+            base_pose = C.to_homogeneous(
+                self.rb_states[self.part_idxs['round_table_base']][0][:3],
+                C.quat2mat(self.rb_states[self.part_idxs['round_table_base']][0][3:7]),
+            )
+            rel_pose = torch.linalg.inv(leg_pose) @ base_pose
+            assembled_rel_poses = self.furniture.assembled_rel_poses[(1, 2)]
+            
+            if self.furniture.assembled(rel_pose.cpu().numpy(), assembled_rel_poses):
+                print("************* Stage 3: Base assembled, assembly complete! *************")
+                self.round_table_fsm_stage = 4
+                return torch.tensor([0, 0, 0, 0, 0, 0, 1, -1], device=self.device).unsqueeze(0), 1
+            
+            # Assemble base to leg
+            goal_pos, goal_ori, gripper, skill_complete = base_part.fsm_step(
+                ee_pos, ee_quat, gripper_width,
+                self.rb_states, self.part_idxs,
+                self.sim_to_april_mat, april_to_robot,
+                'round_table_leg'
+            )
+            
+            delta_pos = goal_pos - ee_pos
+            delta_quat = C.quat_mul(C.quat_conjugate(ee_quat), goal_ori)
+            action = torch.concat([delta_pos, delta_quat, gripper])
+            
+            return action.unsqueeze(0), skill_complete
+        
+        # All stages complete
+        return torch.tensor([0, 0, 0, 0, 0, 0, 1, -1], device=self.device).unsqueeze(0), 1
+    
     def get_assembly_action(self) -> torch.Tensor:
         """Scripted furniture assembly logic.
 
@@ -1676,12 +2211,58 @@ class FurnitureSimEnv(gym.Env):
         if self.furniture_name not in ["one_leg", "cabinet", "lamp", "round_table"]:
             raise NotImplementedError("[one_leg, cabinet, lamp, round_table] are supported for scripted agent")
 
-        if self.assemble_idx > len(self.furniture.should_be_assembled):
+        # Handle round_table with new spatial assignment logic
+        if self.furniture_name == "round_table":
+            return self._get_round_table_assembly_action()
+        
+        if self.assemble_idx >= len(self.furniture.should_be_assembled):
             return torch.tensor([0, 0, 0, 0, 0, 0, 1, -1], device=self.device)
 
-        ee_pos, ee_quat = self.get_ee_pose()
-        gripper_width = self.gripper_width()
-        ee_pos, ee_quat = ee_pos.squeeze(), ee_quat.squeeze()
+        # For round_table, handle robot 1 retreat before robot 2 starts
+        if self.furniture_name == "round_table" and self.assemble_idx == 1 and not self.robot1_retreated:
+            # Robot 1 needs to retreat to safe position before robot 2 starts
+            ee_pos, ee_quat = self.get_ee_pose()
+            ee_pos, ee_quat = ee_pos.squeeze(), ee_quat.squeeze()
+            
+            # Safe retreat position: high and away from work area
+            safe_pos = torch.tensor([0.3, -0.2, 0.25], device=self.device)
+            safe_quat = torch.tensor([0, 0.707, 0, 0.707], device=self.device)  # Pointing up
+            
+            # Check if robot 1 has reached safe position
+            pos_error = torch.norm(ee_pos - safe_pos)
+            if pos_error < 0.03:  # 3cm threshold
+                self.robot1_retreated = True
+                print("************* Robot 1 retreated to safe position *************")
+            
+            # Generate action to move to safe position
+            delta_pos = safe_pos - ee_pos
+            delta_quat = C.quat_mul(C.quat_conjugate(ee_quat), safe_quat)
+            gripper = torch.tensor([-1], dtype=torch.float32, device=self.device)  # Open gripper
+            action = torch.concat([delta_pos, delta_quat, gripper])
+            return action.unsqueeze(0), 0
+        
+        # For round_table, determine which robot should be active
+        if self.furniture_name == "round_table":
+            # assembly_idx 0: (0,1) - robot 1 assembles leg to top
+            # assembly_idx 1: (1,2) - robot 2 assembles base to leg
+            active_robot = 1 if self.assemble_idx == 0 else 2
+            
+            # Get the appropriate end-effector pose and gripper width
+            if active_robot == 1:
+                ee_pos, ee_quat = self.get_ee_pose()
+                gripper_width = self.gripper_width()
+                april_to_robot = self.april_to_robot_mat
+            else:  # active_robot == 2
+                ee_pos, ee_quat = self.get_ee2_pose()
+                gripper_width = self.dof_pos[:, 16:17] + self.dof_pos[:, 17:18]
+                april_to_robot = self.april_to_robot2_mat
+            ee_pos, ee_quat = ee_pos.squeeze(), ee_quat.squeeze()
+        else:
+            # For lamp and other furniture, use robot 1
+            ee_pos, ee_quat = self.get_ee_pose()
+            gripper_width = self.gripper_width()
+            ee_pos, ee_quat = ee_pos.squeeze(), ee_quat.squeeze()
+            april_to_robot = self.april_to_robot_mat
 
         if self.move_neutral:
             if ee_pos[2] <= 0.15 - 0.01:
@@ -1696,6 +2277,7 @@ class FurnitureSimEnv(gym.Env):
                 return action.unsqueeze(0), 0
             else:
                 self.move_neutral = False
+        
         part_idx1, part_idx2 = self.furniture.should_be_assembled[self.assemble_idx]
 
         part1 = self.furniture.parts[part_idx1]
@@ -1730,7 +2312,7 @@ class FurnitureSimEnv(gym.Env):
                 self.rb_states,
                 self.part_idxs,
                 self.sim_to_april_mat,
-                self.april_to_robot_mat,
+                april_to_robot,
             )
         elif not part2.pre_assemble_done:
             print ('************* pre-assemble part2 *************')
@@ -1741,7 +2323,7 @@ class FurnitureSimEnv(gym.Env):
                 self.rb_states,
                 self.part_idxs,
                 self.sim_to_april_mat,
-                self.april_to_robot_mat,
+                april_to_robot,
             )
         else:
             # print ('************* last step *************')
@@ -1754,7 +2336,7 @@ class FurnitureSimEnv(gym.Env):
                 self.rb_states,
                 self.part_idxs,
                 self.sim_to_april_mat,
-                self.april_to_robot_mat,
+                april_to_robot,
                 self.furniture.parts[part_idx1].name,
             )
 
