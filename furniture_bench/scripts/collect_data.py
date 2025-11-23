@@ -12,12 +12,13 @@ from furniture_bench.envs.initialization_mode import Randomness
 def main():
     parser = argparse.ArgumentParser(description="Collect IL data")
     parser.add_argument(
-        "--out-data-path", help="Path to directory to save the data", required=True
+        "--out-data-path", help="Path to directory to save the data",
+        default="output",
     )
     parser.add_argument(
         "--input-device",
         help="Device to control the robot.",
-        choices=["keyboard", "oculus", "keyboard-oculus"],
+        choices=["keyboard", "oculus", "keyboard-oculus", "xbox"],
         default="keyboard-oculus",
     )
     parser.add_argument(

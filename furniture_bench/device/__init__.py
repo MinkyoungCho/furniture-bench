@@ -16,6 +16,11 @@ def make_device(device_name):
 
         device = KeyboardOculusInterface()
 
+    elif device_name == "xbox":
+        from furniture_bench.device.xbox_interface import XboxInterface
+
+        device = XboxInterface()
+
     else:
         raise Exception(
             f"Unrecognized device: {device}. Choose one of 'keyboard', 'oculus', 'keyboard-oculus'"
