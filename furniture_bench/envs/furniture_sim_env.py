@@ -2131,7 +2131,7 @@ class FurnitureSimEnv(gym.Env):
                     action = torch.concat([delta_pos, delta_quat, gripper])
                     return action.unsqueeze(0), 0
 
-            if pos_error > 0.05 and leg_part._state == "release":
+            if pos_error >= 0.04 and leg_part._state == "release":
                 print(" ************* Stage 2: [Issue detected] Leg is not inserted properly *************")
             
             # Assemble leg to top
