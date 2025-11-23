@@ -39,7 +39,7 @@ config: Dict[str, Any] = {
             "stool": 0.065,
             "chair": 0.065,
             "drawer": 0.065,
-            "round_table": 0.065,
+            "round_table": 0.08,
             "cabinet": 0.08,
             "lamp": 0.07,
         },

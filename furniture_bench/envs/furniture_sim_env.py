@@ -216,13 +216,15 @@ class FurnitureSimEnv(gym.Env):
         table_surface_z = table_pos.z + table_half_width
         # First robot (right side, original position)
         self.franka_pose.p = gymapi.Vec3(
-            0.5 * -table_pos.x + 0.1, 0, table_surface_z + ROBOT_HEIGHT
+            0.5 * -table_pos.x + 0.1, -0.2, table_surface_z + ROBOT_HEIGHT
         )
         # Second robot (left edge of table)
         self.franka2_pose.p = gymapi.Vec3(
         #    0.5 * -table_pos.x + 0.1, 0, table_surface_z + ROBOT_HEIGHT
-           -0.1, 0.5 * table_pos.y - 0.1, table_surface_z + ROBOT_HEIGHT
+           0.5 * -table_pos.x + 0.1, 0.2, table_surface_z + ROBOT_HEIGHT
         )
+
+        gymapi.Vec3(self.franka_pose.p.x, self.franka_pose.p.y - 0.4, self.franka_pose.p.z)
 
         self.franka_from_origin_mat = get_mat(
             [self.franka_pose.p.x, self.franka_pose.p.y, self.franka_pose.p.z],
@@ -2094,13 +2096,13 @@ class FurnitureSimEnv(gym.Env):
             )
             rel_pose = torch.linalg.inv(top_pose) @ leg_pose
             assembled_rel_poses = self.furniture.assembled_rel_poses[(0, 1)]
+
+            pos_error = torch.norm(rel_pose[:3, 3] - torch.tensor(assembled_rel_poses[0][:3, 3], device=self.device))
             
             # Debug: print assembly progress every 50 steps
-            if self.env_steps[0] % 50 == 0:
-                pos_error = torch.norm(rel_pose[:3, 3] - torch.tensor(assembled_rel_poses[0][:3, 3], device=self.device))
-                print(f"[Stage 2 Debug] Leg assembly progress - Position error: {pos_error:.4f}m, Current state: {leg_part._state}")
+            if self.env_steps[0] % 50 == 0: print(f"[Stage 2 Debug] Leg assembly progress - Position error: {pos_error:.4f}m, Current state: {leg_part._state}")
             
-            if self.furniture.assembled(rel_pose.cpu().numpy(), assembled_rel_poses):
+            if pos_error < 0.0005:
                 if not self.robot1_retreated:
                     # Start retreat for leg-holding arm
                     print("************* Stage 2: Leg assembled, starting retreat *************")
@@ -2206,7 +2208,6 @@ class FurnitureSimEnv(gym.Env):
         Returns:
             Tuple (action for the assembly task, skill complete mask)
         """
-        print ('************* Hello get_assembly_action *************')
         assert self.num_envs == 1  # Only support one environment for now.
         if self.furniture_name not in ["one_leg", "cabinet", "lamp", "round_table"]:
             raise NotImplementedError("[one_leg, cabinet, lamp, round_table] are supported for scripted agent")

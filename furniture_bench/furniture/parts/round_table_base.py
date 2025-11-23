@@ -131,7 +131,7 @@ class RoundTableBase(Part):
             )[:3, :3]
             pos = base_pose[:4, 3]
             target_pos = (april_to_robot @ pos)[:3]
-            target_pos[2] += 0.010  # Margin
+            target_pos[2] -= 0.010  # Margin
             target = C.to_homogeneous(target_pos, target_ori)
             if self.satisfy(
                 ee_pose, target, pos_error_threshold=0.01, ori_error_threshold=0.3
