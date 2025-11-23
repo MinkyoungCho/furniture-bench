@@ -902,6 +902,11 @@ class FurnitureSimEnv(gym.Env):
                             ee2_quat[env_idx],
                         )
                     else:  # leg_holding_arm == 2
+                        if not hasattr(self, 'stored_action1'):
+                            self.stored_action1 = ee_pos[env_idx]
+                        if not hasattr(self, 'stored_quat1'):
+                            self.stored_quat1 = ee_quat[env_idx]
+
                         # Robot 2 is active
                         self.osc2_ctrls[env_idx].set_goal(
                             action[env_idx][:3] + ee2_pos[env_idx],
@@ -909,8 +914,8 @@ class FurnitureSimEnv(gym.Env):
                         )
                         # Robot 1 stays at current position
                         self.osc_ctrls[env_idx].set_goal(
-                            ee_pos[env_idx],
-                            ee_quat[env_idx],
+                            self.stored_action1,
+                            self.stored_quat1,
                         )
                 
                 elif self.round_table_fsm_stage == 3:
@@ -2125,6 +2130,9 @@ class FurnitureSimEnv(gym.Env):
                     gripper = torch.tensor([-1], dtype=torch.float32, device=self.device)
                     action = torch.concat([delta_pos, delta_quat, gripper])
                     return action.unsqueeze(0), 0
+
+            if pos_error > 0.05 and leg_part._state == "release":
+                print(" ************* Stage 2: [Issue detected] Leg is not inserted properly *************")
             
             # Assemble leg to top
             goal_pos, goal_ori, gripper, skill_complete = leg_part.fsm_step(
