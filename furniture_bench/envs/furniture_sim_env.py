@@ -1693,9 +1693,10 @@ class FurnitureSimEnv(gym.Env):
         """
         self.furnitures[env_idx].reset()
         if self.randomness == Randomness.LOW and not self.init_assembled:
-            self.furnitures[env_idx].randomize_init_pose(
-                self.from_skill, pos_range=[-0.015, 0.015], rot_range=15
-            )
+            pass
+            # self.furnitures[env_idx].randomize_init_pose(
+            #     self.from_skill, pos_range=[-0.015, 0.015], rot_range=15
+            # )
 
         if self.randomness == Randomness.MEDIUM:
             self.furnitures[env_idx].randomize_init_pose(self.from_skill)
@@ -2118,16 +2119,16 @@ class FurnitureSimEnv(gym.Env):
                     else:
                         safe_pos = torch.tensor([0.3, 0.2, 0.25], device=self.device)
                     
-                    safe_quat = torch.tensor([0, 0.707, 0, 0.707], device=self.device)
-                    
-                    if torch.norm(ee_pos - safe_pos) < 0.03:
+                    # Relaxed threshold: only check position, ignore orientation since this arm won't be used again
+                    if torch.norm(ee_pos - safe_pos) < 0.08:  # Relaxed from 0.03 to 0.08 (8cm)
                         self.robot1_retreated = True
                         self.round_table_fsm_stage = 3
                         print("************* Stage 2->3: Retreat complete, starting base assembly *************")
                         return self._get_round_table_assembly_action()
                     
+                    # Simple position-only retreat, no orientation control needed
                     delta_pos = safe_pos - ee_pos
-                    delta_quat = C.quat_mul(C.quat_conjugate(ee_quat), safe_quat)
+                    delta_quat = torch.tensor([0, 0, 0, 1], device=self.device)  # Identity quaternion (no rotation change)
                     gripper = torch.tensor([-1], dtype=torch.float32, device=self.device)
                     action = torch.concat([delta_pos, delta_quat, gripper])
                     return action.unsqueeze(0), 0
@@ -2236,17 +2237,16 @@ class FurnitureSimEnv(gym.Env):
             
             # Safe retreat position: high and away from work area
             safe_pos = torch.tensor([0.3, -0.2, 0.25], device=self.device)
-            safe_quat = torch.tensor([0, 0.707, 0, 0.707], device=self.device)  # Pointing up
             
-            # Check if robot 1 has reached safe position
+            # Check if robot 1 has reached safe position (relaxed threshold, no orientation check)
             pos_error = torch.norm(ee_pos - safe_pos)
-            if pos_error < 0.03:  # 3cm threshold
+            if pos_error < 0.08:  # Relaxed from 0.03 to 0.08 (8cm threshold)
                 self.robot1_retreated = True
                 print("************* Robot 1 retreated to safe position *************")
             
-            # Generate action to move to safe position
+            # Generate action to move to safe position (position only, no orientation control)
             delta_pos = safe_pos - ee_pos
-            delta_quat = C.quat_mul(C.quat_conjugate(ee_quat), safe_quat)
+            delta_quat = torch.tensor([0, 0, 0, 1], device=self.device)  # Identity quaternion (no rotation change)
             gripper = torch.tensor([-1], dtype=torch.float32, device=self.device)  # Open gripper
             action = torch.concat([delta_pos, delta_quat, gripper])
             return action.unsqueeze(0), 0

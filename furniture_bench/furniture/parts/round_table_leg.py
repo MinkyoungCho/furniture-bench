@@ -332,7 +332,7 @@ class RoundTableLeg(Leg):
                 ee_pose,
                 target,
                 pos_error_threshold=0.0,
-                ori_error_threshold=0.3,
+                ori_error_threshold=0.05,
                 max_len=20,
             ):
                 self.prev_pose = target
@@ -356,13 +356,13 @@ class RoundTableLeg(Leg):
 
             rel = rel_rot_mat(leg_pose_robot, target_hole_pose_robot)
             target = rel @ ee_pose
-            target[2] += 0.02636  #
+            target[2] += 0.02624  #
             if self.satisfy(
                 ee_pose,
                 target,
                 pos_error_threshold=0.000,
                 ori_error_threshold=0.0,
-                max_len=30,
+                max_len=40,
             ):
                 self.prev_pose = target
                 next_state = "insert_wait"
@@ -429,4 +429,10 @@ class RoundTableLeg(Leg):
             "insert_wait",
             "insert_release",
             "insert",
+            "reach_leg_floor_xy",
+            "reach_leg_ori",
+            "reach_leg_floor_z",
+            "lift_up",
+            "move_center",
+            "match_leg_ori"
         ]

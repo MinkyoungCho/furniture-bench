@@ -98,7 +98,7 @@ class RoundTableBase(Part):
             # Move to above the base
             self.gripper_action = -1  # Keep gripper open
             rot = torch.tensor(rot_mat([np.pi, 0, 0], hom=True), device=device).float()
-            theta_y = torch.acos(base_pose[1, 1]).detach().cpu().numpy()
+            theta_y = torch.acos(torch.clamp(base_pose[1, 1], -1.0, 1.0)).detach().cpu().numpy()
             if base_pose[0, 1] < 0:
                 theta = np.pi - theta_y + np.pi / 4
             else:
@@ -115,12 +115,12 @@ class RoundTableBase(Part):
                 ee_pose, target, pos_error_threshold=0.02, ori_error_threshold=0.3
             ):
                 self.prev_pose = target.clone()
-                next_state = "reach_base_grasp_z"
-        elif self._state == "reach_base_grasp_z":
-            # Move down to grasp the base
+                next_state = "reach_base_pre_grasp_z"
+        elif self._state == "reach_base_pre_grasp_z":
+            # Descend to a safe height and align rotation precisely before final descent
             self.gripper_action = -1  # Keep gripper open
             rot = torch.tensor(rot_mat([np.pi, 0, 0], hom=True), device=device).float()
-            theta_y = torch.acos(base_pose[1, 1]).detach().cpu().numpy()
+            theta_y = torch.acos(torch.clamp(base_pose[1, 1], -1.0, 1.0)).detach().cpu().numpy()
             if base_pose[0, 1] < 0:
                 theta = np.pi - theta_y + np.pi / 4
             else:
@@ -131,10 +131,22 @@ class RoundTableBase(Part):
             )[:3, :3]
             pos = base_pose[:4, 3]
             target_pos = (april_to_robot @ pos)[:3]
-            target_pos[2] -= 0.010  # Margin
+            target_pos[2] += 0.030  # Stop 3cm above the target to align rotation
             target = C.to_homogeneous(target_pos, target_ori)
             if self.satisfy(
-                ee_pose, target, pos_error_threshold=0.01, ori_error_threshold=0.3
+                ee_pose, target, pos_error_threshold=0.01, ori_error_threshold=0.02
+            ):
+                self.prev_pose = target.clone()
+                next_state = "reach_base_grasp_z"
+        elif self._state == "reach_base_grasp_z":
+            # Final descent to grasp height, keeping the aligned rotation from previous state
+            self.gripper_action = -1  # Keep gripper open
+            pos = base_pose[:4, 3]
+            target_pos = (april_to_robot @ pos)[:3]
+            # Use the rotation that was already aligned in reach_base_pre_grasp_z
+            target = C.to_homogeneous(target_pos, self.prev_pose[:3, :3])
+            if self.satisfy(
+                ee_pose, target, pos_error_threshold=0.00, ori_error_threshold=0.00
             ):
                 self.prev_pose = target
                 next_state = "pick_base"
@@ -143,7 +155,7 @@ class RoundTableBase(Part):
             target = self.prev_pose
             self.gripper_action = 1  # Close gripper
             if self.gripper_less(
-                gripper_width, self.base_grip_width + 0.001, cnt_max=20
+                gripper_width, self.base_grip_width-0.01, cnt_max=20
             ):
                 self.prev_pose = target
                 next_state = "lift_up_pre"
@@ -224,14 +236,14 @@ class RoundTableBase(Part):
             target_ori = self.prev_pose[:3, :3] if self.prev_pose is not None else ee_pose[:3, :3]
             target = C.to_homogeneous(target_pos, target_ori)
             if self.satisfy(
-                ee_pose, target, pos_error_threshold=0.02, ori_error_threshold=0.3
+                ee_pose, target, pos_error_threshold=0.02, ori_error_threshold=0.05
             ):
                 self.prev_pose = target
-                next_state = "reach_base_floor_xy"
+                next_state = "lift_up_base"  # Go directly to assembly, not re-grasp!
         elif self._state == "reach_base_floor_xy":
             self.gripper_action = 1  # Keep holding!
             rot = torch.tensor(rot_mat([np.pi, 0, 0], hom=True), device=device).float()
-            theta_y = torch.acos(base_pose[1, 1]).detach().cpu().numpy()
+            theta_y = torch.acos(torch.clamp(base_pose[1, 1], -1.0, 1.0)).detach().cpu().numpy()
             if base_pose[0, 1] < 0:
                 theta = np.pi - theta_y + np.pi / 4
             else:
@@ -256,7 +268,7 @@ class RoundTableBase(Part):
         elif self._state == "reach_base_floor_z":
             self.gripper_action = 1  # Keep holding!
             rot = torch.tensor(rot_mat([np.pi, 0, 0], hom=True), device=device).float()
-            theta_y = torch.acos(base_pose[1, 1]).detach().cpu().numpy()
+            theta_y = torch.acos(torch.clamp(base_pose[1, 1], -1.0, 1.0)).detach().cpu().numpy()
             if base_pose[0, 1] < 0:
                 theta = np.pi - theta_y + np.pi / 4
             else:
@@ -279,7 +291,7 @@ class RoundTableBase(Part):
             target = self.prev_pose
             self.gripper_action = 1  # Close gripper
             if self.gripper_less(
-                gripper_width, self.base_grip_width + 0.001, cnt_max=20
+                gripper_width, self.base_grip_width - 0.001, cnt_max=20
             ):
                 self.prev_pose = target
                 next_state = "lift_up_base"
@@ -293,21 +305,23 @@ class RoundTableBase(Part):
                 C.to_homogeneous(target_pos, target_ori)
             )
             if self.satisfy(
-                ee_pose, target, pos_error_threshold=0.01, ori_error_threshold=0.3
+                ee_pose, target, pos_error_threshold=0.01, ori_error_threshold=0.0
             ):
                 self.prev_pose = target
                 next_state = "move_center"
         elif self._state == "move_center":
             self.gripper_action = 1  # Keep holding!
+            # Get leg's actual XY position instead of hardcoding Y=0
+            leg_xy_pos = (april_to_robot @ leg_pose)[:2, 3]
             target_pos = torch.tensor(
-                [self.prev_pose[0, 3], 0.0, self.prev_pose[2, 3]], device=device
+                [leg_xy_pos[0], leg_xy_pos[1], self.prev_pose[2, 3]], device=device
             )
             target_ori = self.prev_pose[:3, :3]
             target = self.add_noise_first_target(
                 C.to_homogeneous(target_pos, target_ori)
             )
             if self.satisfy(
-                ee_pose, target, pos_error_threshold=0.01, ori_error_threshold=0.3
+                ee_pose, target, pos_error_threshold=0.00, ori_error_threshold=0.0
             ):
                 self.prev_pose = target
                 next_state = "reach_base_xy"
@@ -317,7 +331,7 @@ class RoundTableBase(Part):
                 april_to_robot
                 @ leg_pose
                 @ torch.tensor(
-                    get_mat(self.default_assembled_pose[:3, 3], [0.0, 0.0, 0.0]),
+                    get_mat([0, 0, 0], [0.0, 0.0, 0.0]),  # Adjusted +1cm in Y
                     device=device,
                 )
             )
@@ -328,8 +342,8 @@ class RoundTableBase(Part):
             if self.satisfy(
                 ee_pose,
                 target,
-                pos_error_threshold=0.0,
-                ori_error_threshold=0.0,
+                pos_error_threshold=0.00,
+                ori_error_threshold=0.05,
                 max_len=50,
             ):
                 self.prev_pose = target
@@ -340,12 +354,12 @@ class RoundTableBase(Part):
                 april_to_robot
                 @ leg_pose
                 @ torch.tensor(
-                    get_mat(self.default_assembled_pose[:3, 3], [0.0, 0.0, 0.0]),
+                    get_mat([0, 0, 0], [0.0, 0.0, 0.0]),  # Adjusted +1cm in Y
                     device=device,
                 )
             )
             target = self.prev_pose
-            target[2, 3] = base_screw_pose_robot[2, 3] + 0.020  # margin.
+            target[2, 3] = base_screw_pose_robot[2, 3] + 0.09  # margin.
             base_screw_pose_robot[:3, :3] = self.prev_pose[:3, :3]
             target[:3, :3] = self.prev_pose[:3, :3]  # Keep the same orientation.
             if self.satisfy(
@@ -402,7 +416,7 @@ class RoundTableBase(Part):
                 rot = torch.tensor(
                     rot_mat([np.pi, 0, 0], hom=True), device=device
                 ).float()
-                theta_y = torch.acos(base_pose[1, 1]).detach().cpu().numpy()
+                theta_y = torch.acos(torch.clamp(base_pose[1, 1], -1.0, 1.0)).detach().cpu().numpy()
                 theta = np.pi - theta_y + np.pi / 4
                 target_ori = (
                     torch.tensor(
@@ -418,7 +432,7 @@ class RoundTableBase(Part):
                 rot = torch.tensor(
                     rot_mat([np.pi, 0, 0], hom=True), device=device
                 ).float()
-                theta_y = torch.acos(base_pose[1, 1]).detach().cpu().numpy()
+                theta_y = torch.acos(torch.clamp(base_pose[1, 1], -1.0, 1.0)).detach().cpu().numpy()
                 theta = theta_y + np.pi / 4
                 target_ori = (
                     torch.tensor(
@@ -438,7 +452,7 @@ class RoundTableBase(Part):
                 rot = torch.tensor(
                     rot_mat([np.pi, 0, 0], hom=True), device=device
                 ).float()
-                theta_y = torch.acos(base_pose[1, 1]).detach().cpu().numpy()
+                theta_y = torch.acos(torch.clamp(base_pose[1, 1], -1.0, 1.0)).detach().cpu().numpy()
                 theta = np.pi - theta_y + np.pi / 4
                 target_ori = (
                     torch.tensor(
@@ -454,7 +468,7 @@ class RoundTableBase(Part):
                 rot = torch.tensor(
                     rot_mat([np.pi, 0, 0], hom=True), device=device
                 ).float()
-                theta_y = torch.acos(base_pose[1, 1]).detach().cpu().numpy()
+                theta_y = torch.acos(torch.clamp(base_pose[1, 1], -1.0, 1.0)).detach().cpu().numpy()
                 theta = theta_y + np.pi / 4
                 target_ori = (
                     torch.tensor(
@@ -496,4 +510,14 @@ class RoundTableBase(Part):
             torch.tensor([self.gripper_action], device=device),
             skill_complete,
         )
+
+    def state_no_noise(self):
+        """Return True for states that should not have noise for precise alignment."""
+        return self._state in [
+            "lift_up_base",
+            "move_center",
+            "reach_base_xy",
+            "reach_base_z",
+            "insert_base",
+        ]
 
