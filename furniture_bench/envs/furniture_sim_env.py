@@ -568,7 +568,7 @@ class FurnitureSimEnv(gym.Env):
         else:
             pos = part.reset_pos[self.from_skill]
             ori = part.reset_ori[self.from_skill]
-        pos[0] += 0.2
+        pos[0] += 0.1
         return pos, ori
 
     def set_viewer(self):
