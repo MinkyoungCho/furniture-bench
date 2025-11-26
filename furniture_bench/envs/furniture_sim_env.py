@@ -105,6 +105,12 @@ class FurnitureSimEnv(gym.Env):
         self.round_table_fsm_stage = 0  # 0: not started, 1: parallel grasp, 2: leg assembly, 3: base assembly
         self.round_table_stage1_complete = {'arm1': False, 'arm2': False}  # Track stage 1 completion
         
+        # For desk dual-arm assembly (4 legs total)
+        self.desk_fsm_stage = 0
+        self.desk_arm_assignments = {}
+        self.desk_stage_complete = {'arm1': False, 'arm2': False}
+        self.desk_legs_assembled = []
+        
         # Furniture for each environment (reward, reset).
         self.furnitures = [furniture_factory(furniture) for _ in range(num_envs)]
 
@@ -1022,6 +1028,33 @@ class FurnitureSimEnv(gym.Env):
                         obstacle_target_rel,
                         gripper_ori_ground,
                     )
+            elif self.furniture_name == "desk":
+                # Desk dual-arm control
+                if self.desk_fsm_stage in [1, 6]:
+                    # Parallel grasp
+                    self.osc_ctrls[env_idx].set_goal(action[env_idx][:3] + ee_pos[env_idx], C.quat_multiply(ee_quat[env_idx], action_quat).to(self.device))
+                    if hasattr(self, 'desk_arm2_action'):
+                        a2q = self.desk_arm2_action[3:7] if self.act_rot_repr == "quat" else C.axisangle2quat(self.desk_arm2_action[3:6])
+                        self.osc2_ctrls[env_idx].set_goal(self.desk_arm2_action[:3] + ee2_pos[env_idx], C.quat_multiply(ee2_quat[env_idx], a2q).to(self.device))
+                elif self.desk_fsm_stage in [2, 7]:
+                    # Arm2 inserts
+                    self.osc2_ctrls[env_idx].set_goal(action[env_idx][:3] + ee2_pos[env_idx], C.quat_multiply(ee2_quat[env_idx], action_quat).to(self.device))
+                    self.osc_ctrls[env_idx].set_goal(ee_pos[env_idx], ee_quat[env_idx])
+                elif self.desk_fsm_stage in [3, 8]:
+                    # Arm2 retreats
+                    self.osc2_ctrls[env_idx].set_goal(action[env_idx][:3] + ee2_pos[env_idx], C.quat_multiply(ee2_quat[env_idx], action_quat).to(self.device))
+                    self.osc_ctrls[env_idx].set_goal(ee_pos[env_idx], ee_quat[env_idx])
+                elif self.desk_fsm_stage in [4, 9]:
+                    # Arm1 inserts
+                    self.osc_ctrls[env_idx].set_goal(action[env_idx][:3] + ee_pos[env_idx], C.quat_multiply(ee_quat[env_idx], action_quat).to(self.device))
+                    self.osc2_ctrls[env_idx].set_goal(torch.tensor([0.45, 0.15, 0.18], device=self.device), torch.tensor([0, 0.707, 0, 0.707], device=self.device))
+                elif self.desk_fsm_stage == 5:
+                    # Arm1 retreats
+                    self.osc_ctrls[env_idx].set_goal(action[env_idx][:3] + ee_pos[env_idx], C.quat_multiply(ee_quat[env_idx], action_quat).to(self.device))
+                    self.osc2_ctrls[env_idx].set_goal(torch.tensor([0.45, 0.15, 0.18], device=self.device), torch.tensor([0, 0.707, 0, 0.707], device=self.device))
+                else:
+                    self.osc_ctrls[env_idx].set_goal(ee_pos[env_idx], ee_quat[env_idx])
+                    self.osc2_ctrls[env_idx].set_goal(ee2_pos[env_idx], ee2_quat[env_idx])
             else:
                 # For other furniture types: only use robot 1
                 self.osc_ctrls[env_idx].set_goal(
@@ -1186,6 +1219,42 @@ class FurnitureSimEnv(gym.Env):
                         # Keep gripper open or maintain current state
                         current_gripper2 = self.dof_pos[env_idx, 16:17] + self.dof_pos[env_idx, 17:18]
                         grip_action[env_idx, 1] = current_gripper2
+                elif self.furniture_name == "desk":
+                    # Desk gripper control
+                    if self.desk_fsm_stage in [1, 6]:
+                        # Parallel grasp
+                        grip_action[env_idx, 0] = self.max_gripper_width if self.last_grasp[env_idx] < 0 else 0.0
+                        if torch.sign(grasp) != torch.sign(self.last_grasp[env_idx]) and torch.abs(grasp) > self.grasp_margin:
+                            grip_action[env_idx, 0] = self.max_gripper_width if grasp < 0 else 0.0
+                            self.last_grasp[env_idx] = grasp
+                        if hasattr(self, 'desk_arm2_action'):
+                            g2 = self.desk_arm2_action[-1]
+                            grip_action[env_idx, 1] = self.max_gripper_width if self.last_grasp2[env_idx] < 0 else 0.0
+                            if torch.sign(g2) != torch.sign(self.last_grasp2[env_idx]) and torch.abs(g2) > self.grasp_margin:
+                                grip_action[env_idx, 1] = self.max_gripper_width if g2 < 0 else 0.0
+                                self.last_grasp2[env_idx] = g2
+                        else:
+                            grip_action[env_idx, 1] = self.max_gripper_width
+                    elif self.desk_fsm_stage in [2, 7]:
+                        # Arm2 inserts
+                        grip_action[env_idx, 1] = self.max_gripper_width if self.last_grasp2[env_idx] < 0 else 0.0
+                        if torch.sign(grasp) != torch.sign(self.last_grasp2[env_idx]) and torch.abs(grasp) > self.grasp_margin:
+                            grip_action[env_idx, 1] = self.max_gripper_width if grasp < 0 else 0.0
+                            self.last_grasp2[env_idx] = grasp
+                        grip_action[env_idx, 0] = 0.0
+                    elif self.desk_fsm_stage in [3, 8]:
+                        grip_action[env_idx, 1] = self.max_gripper_width
+                        grip_action[env_idx, 0] = 0.0
+                    elif self.desk_fsm_stage in [4, 9]:
+                        # Arm1 inserts
+                        grip_action[env_idx, 0] = self.max_gripper_width if self.last_grasp[env_idx] < 0 else 0.0
+                        if torch.sign(grasp) != torch.sign(self.last_grasp[env_idx]) and torch.abs(grasp) > self.grasp_margin:
+                            grip_action[env_idx, 0] = self.max_gripper_width if grasp < 0 else 0.0
+                            self.last_grasp[env_idx] = grasp
+                        grip_action[env_idx, 1] = self.max_gripper_width
+                    else:
+                        grip_action[env_idx, 0] = self.max_gripper_width
+                        grip_action[env_idx, 1] = self.max_gripper_width
                 else:
                     # For other furniture: only control robot 1
                     if (
@@ -1665,6 +1734,14 @@ class FurnitureSimEnv(gym.Env):
         self.round_table_stage1_complete = {'arm1': False, 'arm2': False}
         if hasattr(self, 'round_table_arm2_action'):
             delattr(self, 'round_table_arm2_action')
+        
+        # Reset desk specific variables
+        self.desk_fsm_stage = 0
+        self.desk_arm_assignments = {}
+        self.desk_stage_complete = {'arm1': False, 'arm2': False}
+        self.desk_legs_assembled = []
+        if hasattr(self, 'desk_arm2_action'):
+            delattr(self, 'desk_arm2_action')
 
         if self.save_camera_input:
             self._save_camera_input()
@@ -1719,6 +1796,15 @@ class FurnitureSimEnv(gym.Env):
         self.round_table_stage1_complete = {'arm1': False, 'arm2': False}
         if hasattr(self, 'round_table_arm2_action'):
             delattr(self, 'round_table_arm2_action')
+        
+        # Reset desk specific variables
+        self.desk_fsm_stage = 0
+        if env_idx in self.desk_arm_assignments:
+            del self.desk_arm_assignments[env_idx]
+        self.desk_stage_complete = {'arm1': False, 'arm2': False}
+        self.desk_legs_assembled = []
+        if hasattr(self, 'desk_arm2_action'):
+            delattr(self, 'desk_arm2_action')
 
     def reset_env_to(self, env_idx, state):
         """Reset to a specific state. **MUST refresh in between multiple calls
@@ -1990,6 +2076,241 @@ class FurnitureSimEnv(gym.Env):
         
         return assignment
     
+    def _get_desk_assembly_action(self):
+        """Get assembly action for desk with dual-arm logic for all 4 legs."""
+        env_idx = 0
+        
+        # Stage 0: Initialize
+        if self.desk_fsm_stage == 0:
+            leg_info = []
+            for i in range(1, 5):
+                leg_name = f"desk_leg{i}"
+                if leg_name in self.part_idxs:
+                    leg_idx = self.part_idxs[leg_name][env_idx]
+                    leg_pos = self.rb_states[leg_idx, :3]
+                    leg_info.append((leg_name, leg_pos[1].item(), i))
+            leg_info.sort(key=lambda x: x[1])
+            
+            self.desk_arm_assignments[env_idx] = {
+                'arm1': leg_info[0][0], 'arm2': leg_info[3][0],
+                'remaining': [leg_info[1][0], leg_info[2][0]]
+            }
+            self.desk_fsm_stage = 1
+            self.desk_stage_complete = {'arm1': False, 'arm2': False}
+            print(f"************* Desk Stage 0->1: Arm1={leg_info[0][0]}, Arm2={leg_info[3][0]} *************")
+        
+        # Stage 1: Parallel grasp first pair
+        if self.desk_fsm_stage == 1:
+            ee1_pos, ee1_quat = self.get_ee_pose()
+            ee2_pos, ee2_quat = self.get_ee2_pose()
+            gripper1_width = self.gripper_width()
+            gripper2_width = self.dof_pos[:, 16:17] + self.dof_pos[:, 17:18]
+            ee1_pos, ee1_quat = ee1_pos.squeeze(), ee1_quat.squeeze()
+            ee2_pos, ee2_quat = ee2_pos.squeeze(), ee2_quat.squeeze()
+            
+            arm1_leg = arm2_leg = None
+            for part in self.furniture.parts:
+                if part.name == self.desk_arm_assignments[env_idx]['arm1']: arm1_leg = part
+                elif part.name == self.desk_arm_assignments[env_idx]['arm2']: arm2_leg = part
+            
+            if arm1_leg._state in ["done", "lift_up", "move_center"]: self.desk_stage_complete['arm1'] = True
+            if arm2_leg._state in ["done", "lift_up", "move_center"]: self.desk_stage_complete['arm2'] = True
+            
+            if self.desk_stage_complete['arm1'] and self.desk_stage_complete['arm2']:
+                self.desk_fsm_stage = 2
+                arm2_leg._state = "move_center"
+                print("************* Desk Stage 1->2: Arm2 starts insertion *************")
+                return self._get_desk_assembly_action()
+            
+            goal_pos1, goal_ori1, gripper1, _ = arm1_leg.fsm_step(ee1_pos, ee1_quat, gripper1_width, self.rb_states, self.part_idxs, self.sim_to_april_mat, self.april_to_robot_mat, 'desk_top')
+            goal_pos2, goal_ori2, gripper2, _ = arm2_leg.fsm_step(ee2_pos, ee2_quat, gripper2_width, self.rb_states, self.part_idxs, self.sim_to_april_mat, self.april_to_robot2_mat, 'desk_top')
+            
+            self.desk_arm2_action = torch.concat([goal_pos2 - ee2_pos, C.quat_mul(C.quat_conjugate(ee2_quat), goal_ori2), gripper2])
+            action1 = torch.concat([goal_pos1 - ee1_pos, C.quat_mul(C.quat_conjugate(ee1_quat), goal_ori1), gripper1])
+            return action1.unsqueeze(0), 0
+        
+        # Stage 2: Arm2 inserts
+        if self.desk_fsm_stage == 2:
+            ee2_pos, ee2_quat = self.get_ee2_pose()
+            gripper2_width = self.dof_pos[:, 16:17] + self.dof_pos[:, 17:18]
+            ee2_pos, ee2_quat = ee2_pos.squeeze(), ee2_quat.squeeze()
+            
+            arm2_leg_name = self.desk_arm_assignments[env_idx]['arm2']
+            arm2_leg = next(p for p in self.furniture.parts if p.name == arm2_leg_name)
+            
+            desk_top_pose = C.to_homogeneous(self.rb_states[self.part_idxs['desk_top']][0][:3], C.quat2mat(self.rb_states[self.part_idxs['desk_top']][0][3:7]))
+            leg_pose = C.to_homogeneous(self.rb_states[self.part_idxs[arm2_leg_name]][0][:3], C.quat2mat(self.rb_states[self.part_idxs[arm2_leg_name]][0][3:7]))
+            rel_pose = torch.linalg.inv(desk_top_pose) @ leg_pose
+            leg_part_idx = next(i for i, p in enumerate(self.furniture.parts) if p.name == arm2_leg_name)
+            
+            if self.furniture.assembled(rel_pose.cpu().numpy(), self.furniture.assembled_rel_poses[(0, leg_part_idx)]):
+                self.desk_legs_assembled.append(arm2_leg_name)
+                self.desk_fsm_stage = 3
+                print(f"************* Desk Stage 2->3: {arm2_leg_name} assembled *************")
+                return self._get_desk_assembly_action()
+            
+            goal_pos, goal_ori, gripper, skill_complete = arm2_leg.fsm_step(ee2_pos, ee2_quat, gripper2_width, self.rb_states, self.part_idxs, self.sim_to_april_mat, self.april_to_robot2_mat, 'desk_top')
+            action = torch.concat([goal_pos - ee2_pos, C.quat_mul(C.quat_conjugate(ee2_quat), goal_ori), gripper])
+            return action.unsqueeze(0), skill_complete
+        
+        # Stage 3: Arm2 retreats (just lift up and back a little)
+        if self.desk_fsm_stage == 3:
+            ee2_pos, _ = self.get_ee2_pose()
+            ee2_pos = ee2_pos.squeeze()
+            # Only lift up and back slightly, stay near the work area
+            safe_pos = torch.tensor([0.45, 0.15, 0.18], device=self.device)
+            if torch.norm(ee2_pos - safe_pos) < 0.05:
+                self.desk_fsm_stage = 4
+                arm1_leg_name = self.desk_arm_assignments[env_idx]['arm1']
+                for p in self.furniture.parts:
+                    if p.name == arm1_leg_name: p._state = "move_center"; break
+                print("************* Desk Stage 3->4: Arm1 starts insertion *************")
+                return self._get_desk_assembly_action()
+            action = torch.concat([safe_pos - ee2_pos, torch.tensor([0,0,0,1], device=self.device), torch.tensor([-1], device=self.device)])
+            return action.unsqueeze(0), 0
+        
+        # Stage 4: Arm1 inserts
+        if self.desk_fsm_stage == 4:
+            ee1_pos, ee1_quat = self.get_ee_pose()
+            gripper1_width = self.gripper_width()
+            ee1_pos, ee1_quat = ee1_pos.squeeze(), ee1_quat.squeeze()
+            
+            arm1_leg_name = self.desk_arm_assignments[env_idx]['arm1']
+            arm1_leg = next(p for p in self.furniture.parts if p.name == arm1_leg_name)
+            
+            desk_top_pose = C.to_homogeneous(self.rb_states[self.part_idxs['desk_top']][0][:3], C.quat2mat(self.rb_states[self.part_idxs['desk_top']][0][3:7]))
+            leg_pose = C.to_homogeneous(self.rb_states[self.part_idxs[arm1_leg_name]][0][:3], C.quat2mat(self.rb_states[self.part_idxs[arm1_leg_name]][0][3:7]))
+            rel_pose = torch.linalg.inv(desk_top_pose) @ leg_pose
+            leg_part_idx = next(i for i, p in enumerate(self.furniture.parts) if p.name == arm1_leg_name)
+            
+            if self.furniture.assembled(rel_pose.cpu().numpy(), self.furniture.assembled_rel_poses[(0, leg_part_idx)]):
+                self.desk_legs_assembled.append(arm1_leg_name)
+                self.desk_fsm_stage = 5
+                print(f"************* Desk Stage 4->5: {arm1_leg_name} assembled *************")
+                return self._get_desk_assembly_action()
+            
+            goal_pos, goal_ori, gripper, skill_complete = arm1_leg.fsm_step(ee1_pos, ee1_quat, gripper1_width, self.rb_states, self.part_idxs, self.sim_to_april_mat, self.april_to_robot_mat, 'desk_top')
+            action = torch.concat([goal_pos - ee1_pos, C.quat_mul(C.quat_conjugate(ee1_quat), goal_ori), gripper])
+            return action.unsqueeze(0), skill_complete
+        
+        # Stage 5: Arm1 retreats, prepare second pair (just lift up and back a little)
+        if self.desk_fsm_stage == 5:
+            ee1_pos, _ = self.get_ee_pose()
+            ee1_pos = ee1_pos.squeeze()
+            # Only lift up and back slightly
+            safe_pos = torch.tensor([0.45, -0.15, 0.18], device=self.device)
+            if torch.norm(ee1_pos - safe_pos) < 0.05:
+                remaining = self.desk_arm_assignments[env_idx]['remaining']
+                leg_info = [(n, self.rb_states[self.part_idxs[n][env_idx], 1].item()) for n in remaining]
+                leg_info.sort(key=lambda x: x[1])
+                self.desk_arm_assignments[env_idx]['arm1'] = leg_info[0][0]
+                self.desk_arm_assignments[env_idx]['arm2'] = leg_info[1][0]
+                for p in self.furniture.parts:
+                    if p.name in [leg_info[0][0], leg_info[1][0]]: p.reset()
+                self.desk_stage_complete = {'arm1': False, 'arm2': False}
+                self.desk_fsm_stage = 6
+                print(f"************* Desk Stage 5->6: Arm1={leg_info[0][0]}, Arm2={leg_info[1][0]} *************")
+                return self._get_desk_assembly_action()
+            action = torch.concat([safe_pos - ee1_pos, torch.tensor([0,0,0,1], device=self.device), torch.tensor([-1], device=self.device)])
+            return action.unsqueeze(0), 0
+        
+        # Stage 6: Parallel grasp second pair
+        if self.desk_fsm_stage == 6:
+            ee1_pos, ee1_quat = self.get_ee_pose()
+            ee2_pos, ee2_quat = self.get_ee2_pose()
+            gripper1_width = self.gripper_width()
+            gripper2_width = self.dof_pos[:, 16:17] + self.dof_pos[:, 17:18]
+            ee1_pos, ee1_quat = ee1_pos.squeeze(), ee1_quat.squeeze()
+            ee2_pos, ee2_quat = ee2_pos.squeeze(), ee2_quat.squeeze()
+            
+            arm1_leg = arm2_leg = None
+            for part in self.furniture.parts:
+                if part.name == self.desk_arm_assignments[env_idx]['arm1']: arm1_leg = part
+                elif part.name == self.desk_arm_assignments[env_idx]['arm2']: arm2_leg = part
+            
+            if arm1_leg._state in ["done", "lift_up", "move_center"]: self.desk_stage_complete['arm1'] = True
+            if arm2_leg._state in ["done", "lift_up", "move_center"]: self.desk_stage_complete['arm2'] = True
+            
+            if self.desk_stage_complete['arm1'] and self.desk_stage_complete['arm2']:
+                self.desk_fsm_stage = 7
+                arm2_leg._state = "move_center"
+                print("************* Desk Stage 6->7: Arm2 starts insertion *************")
+                return self._get_desk_assembly_action()
+            
+            goal_pos1, goal_ori1, gripper1, _ = arm1_leg.fsm_step(ee1_pos, ee1_quat, gripper1_width, self.rb_states, self.part_idxs, self.sim_to_april_mat, self.april_to_robot_mat, 'desk_top')
+            goal_pos2, goal_ori2, gripper2, _ = arm2_leg.fsm_step(ee2_pos, ee2_quat, gripper2_width, self.rb_states, self.part_idxs, self.sim_to_april_mat, self.april_to_robot2_mat, 'desk_top')
+            
+            self.desk_arm2_action = torch.concat([goal_pos2 - ee2_pos, C.quat_mul(C.quat_conjugate(ee2_quat), goal_ori2), gripper2])
+            action1 = torch.concat([goal_pos1 - ee1_pos, C.quat_mul(C.quat_conjugate(ee1_quat), goal_ori1), gripper1])
+            return action1.unsqueeze(0), 0
+        
+        # Stage 7: Arm2 inserts second leg
+        if self.desk_fsm_stage == 7:
+            ee2_pos, ee2_quat = self.get_ee2_pose()
+            gripper2_width = self.dof_pos[:, 16:17] + self.dof_pos[:, 17:18]
+            ee2_pos, ee2_quat = ee2_pos.squeeze(), ee2_quat.squeeze()
+            
+            arm2_leg_name = self.desk_arm_assignments[env_idx]['arm2']
+            arm2_leg = next(p for p in self.furniture.parts if p.name == arm2_leg_name)
+            
+            desk_top_pose = C.to_homogeneous(self.rb_states[self.part_idxs['desk_top']][0][:3], C.quat2mat(self.rb_states[self.part_idxs['desk_top']][0][3:7]))
+            leg_pose = C.to_homogeneous(self.rb_states[self.part_idxs[arm2_leg_name]][0][:3], C.quat2mat(self.rb_states[self.part_idxs[arm2_leg_name]][0][3:7]))
+            rel_pose = torch.linalg.inv(desk_top_pose) @ leg_pose
+            leg_part_idx = next(i for i, p in enumerate(self.furniture.parts) if p.name == arm2_leg_name)
+            
+            if self.furniture.assembled(rel_pose.cpu().numpy(), self.furniture.assembled_rel_poses[(0, leg_part_idx)]):
+                self.desk_legs_assembled.append(arm2_leg_name)
+                self.desk_fsm_stage = 8
+                print(f"************* Desk Stage 7->8: {arm2_leg_name} assembled *************")
+                return self._get_desk_assembly_action()
+            
+            goal_pos, goal_ori, gripper, skill_complete = arm2_leg.fsm_step(ee2_pos, ee2_quat, gripper2_width, self.rb_states, self.part_idxs, self.sim_to_april_mat, self.april_to_robot2_mat, 'desk_top')
+            action = torch.concat([goal_pos - ee2_pos, C.quat_mul(C.quat_conjugate(ee2_quat), goal_ori), gripper])
+            return action.unsqueeze(0), skill_complete
+        
+        # Stage 8: Arm2 retreats (just lift up and back a little)
+        if self.desk_fsm_stage == 8:
+            ee2_pos, _ = self.get_ee2_pose()
+            ee2_pos = ee2_pos.squeeze()
+            # Only lift up and back slightly
+            safe_pos = torch.tensor([0.45, 0.15, 0.18], device=self.device)
+            if torch.norm(ee2_pos - safe_pos) < 0.05:
+                self.desk_fsm_stage = 9
+                arm1_leg_name = self.desk_arm_assignments[env_idx]['arm1']
+                for p in self.furniture.parts:
+                    if p.name == arm1_leg_name: p._state = "move_center"; break
+                print("************* Desk Stage 8->9: Arm1 starts insertion *************")
+                return self._get_desk_assembly_action()
+            action = torch.concat([safe_pos - ee2_pos, torch.tensor([0,0,0,1], device=self.device), torch.tensor([-1], device=self.device)])
+            return action.unsqueeze(0), 0
+        
+        # Stage 9: Arm1 inserts last leg
+        if self.desk_fsm_stage == 9:
+            ee1_pos, ee1_quat = self.get_ee_pose()
+            gripper1_width = self.gripper_width()
+            ee1_pos, ee1_quat = ee1_pos.squeeze(), ee1_quat.squeeze()
+            
+            arm1_leg_name = self.desk_arm_assignments[env_idx]['arm1']
+            arm1_leg = next(p for p in self.furniture.parts if p.name == arm1_leg_name)
+            
+            desk_top_pose = C.to_homogeneous(self.rb_states[self.part_idxs['desk_top']][0][:3], C.quat2mat(self.rb_states[self.part_idxs['desk_top']][0][3:7]))
+            leg_pose = C.to_homogeneous(self.rb_states[self.part_idxs[arm1_leg_name]][0][:3], C.quat2mat(self.rb_states[self.part_idxs[arm1_leg_name]][0][3:7]))
+            rel_pose = torch.linalg.inv(desk_top_pose) @ leg_pose
+            leg_part_idx = next(i for i, p in enumerate(self.furniture.parts) if p.name == arm1_leg_name)
+            
+            if self.furniture.assembled(rel_pose.cpu().numpy(), self.furniture.assembled_rel_poses[(0, leg_part_idx)]):
+                self.desk_legs_assembled.append(arm1_leg_name)
+                self.desk_fsm_stage = 10
+                print(f"************* Desk Stage 9->10: ALL 4 LEGS ASSEMBLED! *************")
+                return torch.tensor([0,0,0,0,0,0,1,-1], device=self.device).unsqueeze(0), 1
+            
+            goal_pos, goal_ori, gripper, skill_complete = arm1_leg.fsm_step(ee1_pos, ee1_quat, gripper1_width, self.rb_states, self.part_idxs, self.sim_to_april_mat, self.april_to_robot_mat, 'desk_top')
+            action = torch.concat([goal_pos - ee1_pos, C.quat_mul(C.quat_conjugate(ee1_quat), goal_ori), gripper])
+            return action.unsqueeze(0), skill_complete
+        
+        # Stage 10: Complete
+        return torch.tensor([0,0,0,0,0,0,1,-1], device=self.device).unsqueeze(0), 1
+
     def _get_round_table_assembly_action(self):
         """Get assembly action for round_table with spatial assignment logic."""
         env_idx = 0  # Only support one environment for now
@@ -2219,12 +2540,16 @@ class FurnitureSimEnv(gym.Env):
             Tuple (action for the assembly task, skill complete mask)
         """
         assert self.num_envs == 1  # Only support one environment for now.
-        if self.furniture_name not in ["one_leg", "cabinet", "lamp", "round_table"]:
-            raise NotImplementedError("[one_leg, cabinet, lamp, round_table] are supported for scripted agent")
+        if self.furniture_name not in ["one_leg", "cabinet", "lamp", "round_table", "desk"]:
+            raise NotImplementedError("[one_leg, cabinet, lamp, round_table, desk] are supported for scripted agent")
 
         # Handle round_table with new spatial assignment logic
         if self.furniture_name == "round_table":
             return self._get_round_table_assembly_action()
+        
+        # Handle desk with dual-arm assembly
+        if self.furniture_name == "desk":
+            return self._get_desk_assembly_action()
         
         if self.assemble_idx >= len(self.furniture.should_be_assembled):
             return torch.tensor([0, 0, 0, 0, 0, 0, 1, -1], device=self.device)
